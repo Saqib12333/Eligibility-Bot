@@ -218,6 +218,17 @@ token-*.json
 # Playwright/Browser session state
 login_state.json
 
+# Persistent Chromium profile and cookies
+chrome-profile/
+Trizetto_cookies.pkl
+
+# AI/cache and diagnostics
+payer_cache.json
+logs/
+logs/*.log
+logs/*.json
+logs/*.html
+
 # Generated screenshots and artifacts
 Screenshots/
 screenshots/
