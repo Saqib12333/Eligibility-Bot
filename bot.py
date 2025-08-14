@@ -15,6 +15,7 @@ from google.auth.transport.requests import Request
 import pickle 
 from dotenv import load_dotenv
 import itertools
+from typing import Any
 
 # --- API KEY ROTATION SETUP ---
 load_dotenv() # Load variables from .env file
@@ -59,6 +60,8 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
 # PDF_DRIVE_FOLDER_ID may be empty if unused
 PDF_DRIVE_FOLDER_ID = os.getenv("PDF_DRIVE_FOLDER_ID", "")
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+RUN_ONCE = str(os.getenv("RUN_ONCE", "False")).strip().lower() in ("1", "true", "yes", "on")
+HEADLESS = str(os.getenv("HEADLESS", "True")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- File/Path Configuration ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -98,6 +101,33 @@ SYSTEM_PROMPTS = {
     """
 }
 
+def _safe_response_text(response) -> str:
+    """Best-effort extraction of text from a Gemini response, even if response.text is unavailable."""
+    # Fast path
+    try:
+        t = getattr(response, "text", None)
+        if t:
+            return t
+    except Exception:
+        pass
+    # Fallback: concatenate candidate parts' text
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            if parts:
+                texts = []
+                for p in parts:
+                    txt = getattr(p, "text", None)
+                    if txt:
+                        texts.append(txt)
+                if texts:
+                    return "\n".join(texts)
+    except Exception:
+        pass
+    return ""
+
 def make_ai_call_with_retry(chat_session, prompt_text, max_retries=3):
     """
     Sends a message to the AI chat session with an automatic retry mechanism
@@ -121,8 +151,8 @@ def make_ai_call_with_retry(chat_session, prompt_text, max_retries=3):
 
 def upload_file_to_drive(drive_service, folder_id, file_path, mimetype):
     """Uploads a file to a specific Google Drive folder and returns its shareable link."""
+    file_name = os.path.basename(file_path)
     try:
-        file_name = os.path.basename(file_path)
         print(f"   - Uploading '{file_name}' to Google Drive...")
         file_metadata = {'name': file_name, 'parents': [folder_id]}
         media = MediaFileUpload(file_path, mimetype=mimetype, resumable=True)
@@ -144,17 +174,17 @@ def generate_form_fill_plan(page_html: str, patient_data: dict) -> list:
     print("   - Asking AI to generate a form-filling plan (Model: gemini-2.5-flash)...")
     try:
         api_key = get_next_api_key()
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        
+        genai.configure(api_key=api_key)  # type: ignore[attr-defined]
+        model = genai.GenerativeModel('gemini-2.5-flash')  # type: ignore[attr-defined]
+
         chat = model.start_chat()
         chat.send_message(SYSTEM_PROMPTS['form_filling'])
-        
+
         data_prompt = f"**Patient Data:**\n```json\n{json.dumps(patient_data, indent=2)}\n```\n\n**Form HTML:**\n```html\n{page_html}\n```"
         # --- MODIFIED LINE: Using the retry function ---
         response = make_ai_call_with_retry(chat, data_prompt)
-
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        raw = _safe_response_text(response)
+        cleaned_text = raw.strip().replace("```json", "").replace("```", "").strip()
         plan = json.loads(cleaned_text)
         print("   - AI form-fill plan generated successfully.")
         return plan
@@ -167,8 +197,8 @@ def get_all_report_data(html_content: str) -> dict:
     print("   - Asking AI to generate all report data (Model: gemini-2.5-pro)...")
     try:
         api_key = get_next_api_key()
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-pro')
+        genai.configure(api_key=api_key)  # type: ignore[attr-defined]
+        model = genai.GenerativeModel('gemini-2.5-pro')  # type: ignore[attr-defined]
         
         chat = model.start_chat()
         chat.send_message(SYSTEM_PROMPTS['report_generation'])
@@ -176,7 +206,7 @@ def get_all_report_data(html_content: str) -> dict:
         # --- MODIFIED LINE: Using the retry function ---
         response = make_ai_call_with_retry(chat, f"**HTML Content:**\n```html\n{html_content}\n```")
 
-        raw_text = response.text
+        raw_text = _safe_response_text(response)
         start = raw_text.find('{')
         end = raw_text.rfind('}')
         if start != -1 and end != -1:
@@ -201,21 +231,21 @@ def select_payer_with_ai(page: Page, payer_name: str):
 
         print("   - Asking AI to find the best payer match and create a plan...")
         api_key = get_next_api_key()
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        
+        genai.configure(api_key=api_key)  # type: ignore[attr-defined]
+        model = genai.GenerativeModel('gemini-2.5-flash')  # type: ignore[attr-defined]
+
         chat = model.start_chat()
         chat.send_message(SYSTEM_PROMPTS['payer_selection'])
 
         data_prompt = f"The user wants to select: **\"{payer_name}\"**.\n\n**Payer List HTML:**\n```html\n{list_html}\n```"
         # --- MODIFIED LINE: Using the retry function ---
         response = make_ai_call_with_retry(chat, data_prompt)
-
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        raw = _safe_response_text(response)
+        cleaned_text = raw.strip().replace("```json", "").replace("```", "").strip()
         plan = json.loads(cleaned_text)
 
         print(f"   - AI Plan Received. Category: '{plan['category_text']}', Payer: '{plan['payer_text']}'")
-        
+
         category_element = page.get_by_text(plan['category_text'], exact=True).first
         category_element.click()
         page.wait_for_timeout(1000)
@@ -270,10 +300,23 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
 
 
 
-        # --- Upload Screenshot ---
+        # --- Upload Screenshot (robust with fallback) ---
         screenshot_path = os.path.join(SCREENSHOT_DIR, f"screenshot_{patient_name_str}.png")
-        report_container.screenshot(path=screenshot_path)
-        screenshot_link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, screenshot_path, 'image/png')
+        try:
+            # Ensure the element is in view, then try an element-level screenshot first
+            report_container.scroll_into_view_if_needed()
+            report_container.screenshot(path=screenshot_path, timeout=60000)
+        except Exception as se:
+            print(f"   -!- Element screenshot failed ({se}). Falling back to full-page screenshot...")
+            try:
+                page.screenshot(path=screenshot_path, full_page=True)
+            except Exception as se2:
+                print(f"   -!- Full-page screenshot also failed: {se2}")
+        # Attempt upload if a file was created
+        if os.path.exists(screenshot_path):
+            screenshot_link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, screenshot_path, 'image/png')
+        else:
+            print("   -!- No screenshot file present to upload.")
         
         # Prepare results for Google Sheet update
         summaries = all_data.get("summaries", {})
@@ -308,7 +351,7 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
         }
 
 
-def get_oauth_credentials(scopes: list) -> Credentials:
+def get_oauth_credentials(scopes: list) -> Any:
     """Gets user credentials using the manual OAuth 2.0 console flow."""
     creds = None
     # The file token.json stores the user's access and refresh tokens.
@@ -362,7 +405,7 @@ def main():
     print("-> Google Sheets & Drive authentication successful.")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, slow_mo=50)
+        browser = p.chromium.launch(headless=HEADLESS, slow_mo=50)
         context, page = (None, None)
 
         if os.path.exists(STATE_FILE):
@@ -396,6 +439,10 @@ def main():
             page.wait_for_url("**/default.aspx**", timeout=30000)
             print("-> LOGIN SUCCESSFUL! Saving session...")
             context.storage_state(path=STATE_FILE)
+
+        # Ensure page has been initialized correctly
+        if page is None:
+            raise RuntimeError("Playwright page failed to initialize.")
 
         while True:
             try:
@@ -438,6 +485,9 @@ def main():
                     print("-> Sheet updated with comprehensive details and links.")
 
                 else:
+                    if RUN_ONCE:
+                        print("-> No new records found. RUN_ONCE is enabled; exiting.")
+                        break
                     print(f"-> No new records found. Waiting {CHECK_INTERVAL_SECONDS} seconds...")
                     time.sleep(CHECK_INTERVAL_SECONDS)
 

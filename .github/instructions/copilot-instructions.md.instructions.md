@@ -1,3 +1,6 @@
+---
+applyTo: '**/*'
+---
 # Copilot instructions for Eligibility-Bot
 
 Context for GitHub Copilot agents and human developers.
@@ -33,3 +36,4 @@ Context for GitHub Copilot agents and human developers.
 ## Security and secrets
 - `.gitignore` excludes credentials, tokens, `.env`, and generated artifacts.
 - If secrets were committed, remove with git history rewriting before pushing.
+- Rotate API keys and credentials regularly.
