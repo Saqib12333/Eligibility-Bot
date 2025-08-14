@@ -205,3 +205,25 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- Project-specific ignores (Eligibility-Bot) ---
+# Google OAuth/Service credentials and tokens
+client_secret.json
+credentials.json
+token.json
+token.pickle
+token.pkl
+token-*.json
+
+# Playwright/Browser session state
+login_state.json
+
+# Generated screenshots and artifacts
+Screenshots/
+screenshots/
+
+# OS cruft (Windows/Explorer)
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+desktop.ini
