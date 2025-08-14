@@ -24,6 +24,8 @@ Context for GitHub Copilot agents and human developers.
 - Prefer explicit waits and robust selectors in Playwright.
 - Avoid reflowing the entire file on small changes; keep diffs minimal.
 - Add type hints where obvious, but keep pragmatic for dynamic libs.
+ - Keep AI outputs strictly JSON for report parsing; sanitize HTML inputs (remove scripts/styles/comments, collapse whitespace, truncate) to reduce token pressure.
+ - If parsing fails, write diagnostics (raw AI output + sanitized HTML) to `logs/` with timestamped names.
 
 ## Testing tips
 - Set `HEADLESS=false` during debugging.
@@ -33,6 +35,7 @@ Context for GitHub Copilot agents and human developers.
 ## Security and secrets
 - `.gitignore` excludes credentials, tokens, `.env`, and generated artifacts.
 - If secrets were committed, remove with git history rewriting before pushing.
+ - Ignore persistent Chromium profile dir `chrome-profile/`, cookies `Trizetto_cookies.pkl`, payer cache, and logs.
 
 ## Roadmap for changes
 
@@ -42,6 +45,7 @@ Context for GitHub Copilot agents and human developers.
 - Implement per-row operation timeout and fail fast with clear sheet errors.
 - Switch to logging (console + rotating file), INFO default, DEBUG via env.
 - Log compact result summaries and classify errors; expose simple counters at run end.
+ - Harden AI parsing: sanitized HTML, strict JSON prompts, robust JSON extraction, diagnostics files on failure.
 
 ### Phase B (Performance, Maintainability)
 - Pre-trim AI prompt contexts (report HTML, payer list) before prompting.
