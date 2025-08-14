@@ -33,3 +33,23 @@ Context for GitHub Copilot agents and human developers.
 ## Security and secrets
 - `.gitignore` excludes credentials, tokens, `.env`, and generated artifacts.
 - If secrets were committed, remove with git history rewriting before pushing.
+
+## Roadmap for changes
+
+### Phase A (Reliability, Observability)
+- Cache payer selection per payer to avoid repeated AI calls and variability.
+- Add waits before screenshots `page.wait_for_load_state('networkidle')` and a brief pause post-expand.
+- Implement per-row operation timeout and fail fast with clear sheet errors.
+- Switch to logging (console + rotating file), INFO default, DEBUG via env.
+- Log compact result summaries and classify errors; expose simple counters at run end.
+
+### Phase B (Performance, Maintainability)
+- Pre-trim AI prompt contexts (report HTML, payer list) before prompting.
+- Keep reusing context; consider preloading eligibility page after login.
+- Split into modules: `ai.py`, `sheets_drive.py`, `trizetto.py`, `main.py`.
+
+### Phase C (Artifacts, Safety, UX)
+- Save raw report HTML and upload with screenshots.
+- Timestamp artifacts and include row indices.
+- Add print-to-PDF export upload.
+- Add a “Processing…” watchdog and graceful shutdown.

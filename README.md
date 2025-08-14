@@ -42,3 +42,25 @@ On first run, you’ll be prompted to visit a URL and paste back a verification 
 
 ## License
 Proprietary. Internal use only unless otherwise stated.
+
+## Roadmap
+
+### Phase A (Reliability, Observability)
+1. Cache payer selection plans per payer name to reduce AI calls and variability.
+2. Add waits before screenshots: `page.wait_for_load_state('networkidle')` and a short pause after expand.
+3. Per-row operation timeout; fail fast and write a clear error to the sheet.
+4. Switch to Python logging (console + rotating file), INFO by default, DEBUG via env.
+5. Log compact result summaries and classify errors (AI, network, page, sheet).
+6. Emit simple metrics counters (processed/ok/fail/retried) at the end of each run.
+
+### Phase B (Performance, Maintainability)
+1. Minimize AI context: pre-trim report HTML and payer list before prompting.
+2. Reuse browser/context across rows (already in place); consider preloading pages after login.
+3. Split codebase into modules: `ai.py`, `sheets_drive.py`, `trizetto.py`, `main.py`.
+
+### Phase C (Artifacts, Safety, UX)
+1. Save raw report HTML and upload alongside screenshot.
+2. Timestamp artifact filenames and include row index to avoid collisions.
+3. Add print-to-PDF export and upload as a stable artifact.
+4. Add “Processing…” watchdog (e.g., mark stale > 30 mins as error with reason).
+5. Graceful shutdown (handle Ctrl+C) to flush logs and release resources.
