@@ -101,3 +101,36 @@ Status: in progress; major items implemented
 2. Timestamp artifact filenames and include row index to avoid collisions.
 3. Add print-to-PDF export and upload as a stable artifact.
 4. Add “Processing…” watchdog for stale rows and graceful shutdown to flush logs.
+
+---
+
+## Installation
+1) Ensure Python 3.10+ is installed
+2) Create and activate a virtual environment
+3) Install dependencies from `requirements.txt`
+
+## Environment setup
+- Copy `.env.example` to `.env` and fill all required values (see Configuration above).
+- Place `client_secret.json` (OAuth Desktop Client) in the project root.
+
+## How to run
+- Default:
+	- Set `HEADLESS=false` in `.env` if you want to see the browser.
+	- Run the bot; it will poll for new rows and process them.
+- One-shot:
+	- Set `RUN_ONCE=true` to process only the next pending row.
+
+## Google Sheet format
+Inputs (A–F): DOS, First Name, Last Name, DOB, Payer Name, Member/Subscriber ID.
+Outputs (G–N): Status, Policy Begin, Policy End, Screenshot Link, Copay, Deductible, Coinsurance, Out of Pocket.
+
+## FAQs
+- Q: I still get OTP prompts every run.
+	- A: Ensure `CHROME_PROFILE_DIR` points to a persistent folder and `COOKIES_FILE` exists/updates after manual OTP. Subsequent runs should use those.
+- Q: Why do I see “Failed to parse report”? 
+	- A: Check `logs/ai_report_fail_*.json` and `logs/report_html_*.html`. The model may have produced non-JSON or truncated output; sanitized inputs and extractor help, but diagnostics will show exact content.
+- Q: Where are screenshots stored?
+	- A: Locally under `Screenshots/` and uploaded to Google Drive folder set by `DRIVE_FOLDER_ID`.
+
+## Support
+Open an issue internally or provide failing diagnostics files to maintainers for prompt fixes.
