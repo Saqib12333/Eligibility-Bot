@@ -24,23 +24,28 @@ Automates real-time insurance eligibility checks in TriZetto, extracts structure
 4) Install dependencies and run
 
 ### Setup
-- Create `.env` from `.env.example` and fill all required values.
-- Ensure `client_secret.json` (OAuth Desktop Client) is present.
+- Hardened AI parsing: targeted HTML sanitization (keeps status, plan dates, and key benefits tables), strict JSON prompt with structured-output, robust JSON extractor, and diagnostics on failure
+- Gemini API keys (1–3 keys supported with per-run start rotation)
 - Optional: put existing TriZetto cookies into `Trizetto_cookies.pkl` to avoid OTP on first run.
 
-### First run (manual OAuth)
-On first run, you’ll be prompted to visit a URL and paste back a verification code. Token is stored in `token.json` (ignored by Git).
+	 - Input HTML is targeted-sanitized (status h1, BasicProfile plan dates, and benefits tables for Co-Payment, Co-Insurance, Deductible, Out-of-Pocket; noise removed; whitespace collapsed; truncated safely).
+	 - Uses structured-output first; falls back to text JSON prompt if needed. A robust extractor parses JSON if the model adds extra text.
 
-## Run
-- HEADLESS mode: set `HEADLESS=false` in `.env` for visible runs.
+- Per-row AI token usage summary printed to console and logs (prompt/candidates/total).
 - One-shot mode: set `RUN_ONCE=true` to process the next pending row and exit.
-- The bot polls Google Sheets for new records and writes back results, including a screenshot link.
-
+	- `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` (rotation with per-run start index)
 ## Configuration (env vars)
-- Google/Sheets/Drive
+- High token usage: confirm that `REPORT_HTML_MAX_CHARS` is reasonable and targeted sanitization is active. The bot keeps only eligibility essentials to reduce tokens while preserving Deductible/OOP sections.
 	- `SPREADSHEET_ID`, `SHEET_NAME`, `DRIVE_FOLDER_ID`, optional `PDF_DRIVE_FOLDER_ID`
-	- OAuth files: `client_secret.json` in project root; token persisted to `token.json`
 - TriZetto login
+- Q: Why do I sometimes see 429s on gemini-2.5-pro?
+	- A: Per-run key rotation helps distribute calls across keys between runs. The bot honors server-provided `retry_delay` and falls back to a lighter model if necessary.
+
+## What’s new (v2.2.0)
+- Per-run API key rotation and attempt-level logging (model + key suffix, retry_delay observed)
+- Targeted report sanitization to keep eligibility essentials and reduce tokens
+- Payer-based form-fill plan cache (`FORM_FILL_CACHE_FILE`)
+- Per-row AI token usage printing
 	- `TRIZETTO_USERNAME`, `TRIZETTO_PASSWORD`, `OTP_EMAIL_ADDRESS_TEXT`
 	- Persistent profile dir: `CHROME_PROFILE_DIR` (default `./chrome-profile`)
 	- Cookies file: `COOKIES_FILE` (default `./Trizetto_cookies.pkl`)

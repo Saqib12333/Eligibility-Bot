@@ -30,7 +30,7 @@ Context for GitHub Copilot agents and human developers.
 - Prefer explicit waits and robust selectors in Playwright.
 - Avoid reflowing the entire file on small changes; keep diffs minimal.
 - Add type hints where obvious, but keep pragmatic for dynamic libs.
- - Keep AI outputs strictly JSON for report parsing; sanitize HTML inputs (remove scripts/styles/comments, collapse whitespace, truncate) to reduce token pressure.
+ - Keep AI outputs strictly JSON for report parsing; target-sanitize report HTML inputs (keep status h1, plan begin/end, and key benefit tables; remove noise) to reduce token pressure.
  - On parse failure, write diagnostics (raw AI text + sanitized HTML) under `logs/` with timestamps.
 
 ## Testing tips
@@ -79,6 +79,7 @@ Minimal single-file implementation with clear responsibilities inside `bot.py`:
 	- `_sanitize_html_for_ai()` to reduce HTML noise/size.
 	- `_extract_json_object()` to reliably parse a single JSON object from AI output.
 - Payer selection cache: JSON file at `PAYER_CACHE_FILE`.
+- Form-fill plan cache per payer: JSON file at `FORM_FILL_CACHE_FILE`.
 - Processing loop: fetch next row → select payer → AI fill plan → submit → expand/report → AI parse → screenshot/upload → update sheet.
 - Logging and metrics: rotating file in `logs/` + console; run summary at end.
 
@@ -103,7 +104,7 @@ Project files you should know:
 ## Environment variables (complete list)
 - Google/Sheets/Drive: `SPREADSHEET_ID`, `SHEET_NAME`, `DRIVE_FOLDER_ID`, `PDF_DRIVE_FOLDER_ID` (optional)
 - TriZetto: `TRIZETTO_USERNAME`, `TRIZETTO_PASSWORD`, `OTP_EMAIL_ADDRESS_TEXT`
-- AI: `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`
+- AI: `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` (per-run start rotation)
 - Behavior: `HEADLESS`, `RUN_ONCE`, `CHECK_INTERVAL_SECONDS`, `OPERATION_TIMEOUT_SECONDS`, `LOG_LEVEL`
 - Files/paths: `PAYER_CACHE_FILE`, `CHROME_PROFILE_DIR`, `COOKIES_FILE`
 
@@ -134,7 +135,6 @@ Rows are considered “pending” when columns A–F are filled and column G is 
 - Report generation (gemini-2.5-pro): returns a single JSON object with keys:
 	- `status` (e.g., "Active Coverage"), `policy_begin`, `policy_end`
 	- `summaries` object: `copay`, `deductible`, `coinsurance`, `out_of_pocket`
-	- `tables` object: keys are section names; values are arrays of row objects (1 per line item)
 
 Strict output rules: double quotes, no trailing commas/comments; if missing, use "Not Found".
 
