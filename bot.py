@@ -15,7 +15,7 @@ from google.auth.transport.requests import Request
 import pickle 
 from dotenv import load_dotenv
 import itertools
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import re
 import logging
 from logging.handlers import RotatingFileHandler
@@ -35,11 +35,14 @@ VALID_API_KEYS = [key for key in API_KEYS if key]
 if not VALID_API_KEYS:
     raise ValueError("FATAL ERROR: No Gemini API keys found in .env file. Please check your .env configuration.")
 
-# Create an infinite cycle of the valid API keys
-api_key_cycler = itertools.cycle(VALID_API_KEYS)
+# API key cycle is initialized after logging setup (uses logs_dir). We'll rotate per run.
+api_key_cycler = None
 
 def get_next_api_key():
     """Returns the next API key from the rotation."""
+    global api_key_cycler
+    if api_key_cycler is None:
+        api_key_cycler = itertools.cycle(VALID_API_KEYS)
     return next(api_key_cycler)
 
 # --- CONFIGURATION ---
@@ -68,7 +71,7 @@ RUN_ONCE = str(os.getenv("RUN_ONCE", "False")).strip().lower() in ("1", "true", 
 HEADLESS = str(os.getenv("HEADLESS", "True")).strip().lower() in ("1", "true", "yes", "on")
 OPERATION_TIMEOUT_SECONDS = int(os.getenv("OPERATION_TIMEOUT_SECONDS", "300"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-REPORT_HTML_MAX_CHARS = int(os.getenv("REPORT_HTML_MAX_CHARS", "60000"))
+REPORT_HTML_MAX_CHARS = int(os.getenv("REPORT_HTML_MAX_CHARS", "100000"))
 KEEP_BROWSER_OPEN = str(os.getenv("KEEP_BROWSER_OPEN", "False")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- File/Path Configuration ---
@@ -80,6 +83,7 @@ SCREENSHOT_DIR = os.path.join(SCRIPT_DIR, "Screenshots")
 PAYER_CACHE_FILE = os.getenv("PAYER_CACHE_FILE", os.path.join(SCRIPT_DIR, "payer_cache.json"))
 CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", os.path.join(SCRIPT_DIR, "chrome-profile"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", os.path.join(SCRIPT_DIR, "Trizetto_cookies.pkl"))
+FORM_FILL_CACHE_FILE = os.getenv("FORM_FILL_CACHE_FILE", os.path.join(SCRIPT_DIR, "form_fill_cache.json"))
 
 # --- LOGGING SETUP ---
 logs_dir = os.path.join(SCRIPT_DIR, "logs")
@@ -97,7 +101,57 @@ if not logger.handlers:
     logger.addHandler(ch)
     logger.addHandler(fh)
 
+# Initialize API key cycle with per-run rotation and persist last start index under logs/
+def _init_api_key_cycle():
+    global api_key_cycler
+    try:
+        n = len(VALID_API_KEYS)
+        if n == 0:
+            raise ValueError("No valid API keys available for rotation.")
+        idx_path = os.path.join(logs_dir, "key_index.json")
+        last_idx = -1
+        try:
+            if os.path.exists(idx_path):
+                with open(idx_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    last_idx = int(data.get("last_used_index", -1))
+        except Exception:
+            last_idx = -1
+        start_idx = (last_idx + 1) % n
+        ordered = VALID_API_KEYS[start_idx:] + VALID_API_KEYS[:start_idx]
+        api_key_cycler = itertools.cycle(ordered)
+        # Persist new start for next run
+        try:
+            with open(idx_path, "w", encoding="utf-8") as f:
+                json.dump({"last_used_index": start_idx}, f)
+        except Exception:
+            pass
+        print(f"-> API key rotation: starting with key index {start_idx} (***{(ordered[0] or '')[-4:]})")
+    except Exception as e:
+        print(f"-!- Failed to initialize API key rotation: {e}. Using default order.")
+        api_key_cycler = itertools.cycle(VALID_API_KEYS)
+
+_init_api_key_cycle()
+
 # --- AI AND AUTOMATION LOGIC ---
+
+# Token usage accounting (per-row)
+USAGE_TOKENS = {"prompt": 0, "candidates": 0, "total": 0}
+
+def _accumulate_usage(resp: Any):
+    try:
+        um = getattr(resp, "usage_metadata", None)
+        if not um:
+            return
+        # Support both attribute and dict-like access
+        p = getattr(um, "prompt_token_count", None) or um.get("prompt_token_count", 0)
+        c = getattr(um, "candidates_token_count", None) or um.get("candidates_token_count", 0)
+        t = getattr(um, "total_token_count", None) or um.get("total_token_count", 0)
+        USAGE_TOKENS["prompt"] += int(p or 0)
+        USAGE_TOKENS["candidates"] += int(c or 0)
+        USAGE_TOKENS["total"] += int(t or 0)
+    except Exception:
+        pass
 
 SYSTEM_PROMPTS = {
     "form_filling": """
@@ -133,6 +187,7 @@ SYSTEM_PROMPTS = {
 
 # --- PAYER PLAN CACHE ---
 _payer_cache: Dict[str, Dict[str, str]] = {}
+_form_fill_cache: Dict[str, list] = {}
 
 def _normalize_payer_key(name: str) -> str:
     return (name or "").strip().lower()
@@ -156,34 +211,103 @@ def _save_payer_cache():
     except Exception as e:
         logger.warning(f"Failed to save payer cache: {e}")
 
+def _load_form_fill_cache():
+    global _form_fill_cache
+    try:
+        if os.path.exists(FORM_FILL_CACHE_FILE):
+            with open(FORM_FILL_CACHE_FILE, "r", encoding="utf-8") as f:
+                _form_fill_cache = json.load(f)
+                if not isinstance(_form_fill_cache, dict):
+                    _form_fill_cache = {}
+    except Exception as e:
+        logger.warning(f"Failed to load form-fill cache: {e}")
+        _form_fill_cache = {}
+
+def _save_form_fill_cache():
+    try:
+        with open(FORM_FILL_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_form_fill_cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save form-fill cache: {e}")
+
 def _check_timeout(deadline_ts: Optional[float] = None):
     if deadline_ts and time.time() > deadline_ts:
         raise TimeoutError("Operation timed out for this row.")
 
 # --- INPUT SANITIZATION FOR AI ---
 def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> str:
-    """Reduces noise and size of HTML before sending to the model.
+    """Targeted sanitization to retain only essential eligibility content.
 
-    - Removes <script> and <style> blocks
-    - Strips HTML comments
-    - Collapses excessive whitespace
-    - Truncates to max_chars to avoid token/length issues
+    Keep:
+    - <h1 id="trnEligibilityStatus">...</h1>
+    - <div id="BasicProfile"> (prefer only Plan Begin/End rows)
+    - Benefit sections + tables for: Co-Payment, Co-Insurance, Deductible, Out of Pocket
+
+    Otherwise remove scripts/styles/comments, collapse whitespace, and truncate.
+    Fallback to base cleanup if targeted extraction fails.
     """
     try:
-        # Remove scripts/styles
-        html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
-        html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.IGNORECASE)
-        # Remove comments
-        html = re.sub(r"<!--([\s\S]*?)-->", " ", html)
-        # Collapse whitespace
-        html = re.sub(r"\s+", " ", html).strip()
-        # Truncate
-        if len(html) > max_chars:
-            html = html[:max_chars]
+        raw = html
+        # Strip scripts/styles/comments
+        raw = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"<style[\s\S]*?</style>", " ", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"<!--([\s\S]*?)-->", " ", raw)
+
+        pieces: List[str] = []
+        # 1) Eligibility Status
+        m = re.search(r"<h1[^>]*id=\"trnEligibilityStatus\"[^>]*>\s*([\s\S]*?)\s*</h1>", raw, re.IGNORECASE)
+        if m:
+            pieces.append(f"<h1 id=\"trnEligibilityStatus\">{m.group(1)}</h1>")
+
+        # 2) Basic Profile (Plan Begin/End)
+        m = re.search(r"<div[^>]*id=\"BasicProfile\"[^>]*>[\s\S]*?</div>", raw, re.IGNORECASE)
+        if m:
+            bp = m.group(0)
+            keep_rows: List[str] = []
+            for lab in ["Plan Begin Date", "Plan End Date"]:
+                mm = re.search(rf"<dt>\s*{re.escape(lab)}\s*:</dt>\s*<dd>([^<]+)</dd>", bp, re.IGNORECASE)
+                if mm:
+                    keep_rows.append(f"<dt>{lab}:</dt><dd>{mm.group(1)}</dd>")
+            if keep_rows:
+                pieces.append("<div id=\"BasicProfile\"><dl>" + "".join(keep_rows) + "</dl></div>")
+            else:
+                pieces.append(bp)
+
+        # 3) Benefits sections of interest
+        section_labels = [
+            "Co-Payment",
+            "Co-Insurance",
+            "Deductible",
+            "Out of Pocket",
+            "Out-of-Pocket",
+        ]
+        for lab in section_labels:
+            pat = re.compile(
+                rf"<a[^>]*class=\"sections[^\"]*\"[^>]*>\s*{lab}\s*</a>[\s\S]*?(<div[^>]*id=\"BenefitsTable\d+\"[\s\S]*?</div>)",
+                re.IGNORECASE,
+            )
+            mm = pat.search(raw)
+            if mm:
+                pieces.append(f"<a class=\"sections\">{lab}</a>" + mm.group(1))
+
+        content = "\n".join(pieces) if pieces else raw
+        content = re.sub(r"\s+", " ", content).strip()
+        if len(content) > max_chars:
+            content = content[:max_chars]
+        return content
     except Exception:
-        # Best-effort only; if anything fails, return original
+        # Fall back to base cleanup
         pass
-    return html
+    try:
+        fallback = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+        fallback = re.sub(r"<style[\s\S]*?</style>", " ", fallback, flags=re.IGNORECASE)
+        fallback = re.sub(r"<!--([\s\S]*?)-->", " ", fallback)
+        fallback = re.sub(r"\s+", " ", fallback).strip()
+        if len(fallback) > max_chars:
+            fallback = fallback[:max_chars]
+        return fallback
+    except Exception:
+        return html
 
 def _extract_json_object(text: str) -> Optional[str]:
     """Extract the first top-level JSON object from text using brace matching.
@@ -246,9 +370,10 @@ def _fallback_parse_report(html: str) -> Dict[str, Any]:
             plan_end = me.group(1).strip()
 
         # Summaries: naive snippets from tables
-        def _summary_for(keyword: str) -> str:
-            # Grab a small window around keyword occurrences
-            pat = re.compile(rf"<a[^>]*>\s*{re.escape(keyword)}\s*</a>[\s\S]*?<table[\s\S]*?</table>", re.IGNORECASE)
+        def _summary_for(keyword: str, is_regex: bool = False) -> str:
+            # Grab a small window around keyword occurrences. If is_regex=True, treat keyword as a regex alternation.
+            safe_kw = keyword if is_regex else re.escape(keyword)
+            pat = re.compile(rf"<a[^>]*>\s*({safe_kw})\s*</a>[\s\S]*?<table[\s\S]*?</table>", re.IGNORECASE)
             m = pat.search(text)
             if not m:
                 return "Not Found"
@@ -260,7 +385,7 @@ def _fallback_parse_report(html: str) -> Dict[str, Any]:
             "copay": _summary_for("Co-Payment"),
             "deductible": _summary_for("Deductible"),
             "coinsurance": _summary_for("Co-Insurance"),
-            "out_of_pocket": _summary_for("Out of Pocket|Out-of-Pocket"),
+            "out_of_pocket": _summary_for("Out of Pocket|Out-of-Pocket", is_regex=True),
         }
 
         return {
@@ -377,12 +502,16 @@ def _ai_text_with_retries(model_names, system_prompt: str, user_prompt: str, att
         model_name = model_names[min(i, len(model_names) - 1)]
         try:
             api_key = get_next_api_key()
+            alias = (api_key or "")[-4:]
+            print(f"   - AI text attempt {i+1}/{attempts}: model={model_name}, key=***{alias}")
             genai.configure(api_key=api_key)  # type: ignore[attr-defined]
             model = genai.GenerativeModel(model_name)  # type: ignore[attr-defined]
             chat = model.start_chat()
             if system_prompt:
-                chat.send_message(system_prompt)
+                sys_resp = chat.send_message(system_prompt)
+                _accumulate_usage(sys_resp)
             response = chat.send_message(user_prompt)
+            _accumulate_usage(response)
             text = _safe_response_text(response).strip()
             if not text:
                 raise RuntimeError("Empty AI response text")
@@ -395,6 +524,13 @@ def _ai_text_with_retries(model_names, system_prompt: str, user_prompt: str, att
             if i < attempts - 1 and transient:
                 # Exponential backoff with small jitter via base_backoff multiplier
                 sleep_s = (base_backoff ** i) * 2
+                # Respect server-advised retry delay if provided
+                try:
+                    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(e))
+                    if m:
+                        sleep_s = max(sleep_s, int(m.group(1)))
+                except Exception:
+                    pass
                 print(f"   -!- AI attempt {i+1} failed on {model_name}: {e}. Retrying in {int(sleep_s)}s with rotated key/model...")
                 try:
                     time.sleep(sleep_s)
@@ -426,10 +562,12 @@ def _ai_json_with_schema(
         model_name = model_names[min(i, len(model_names) - 1)]
         try:
             api_key = get_next_api_key()
+            alias = (api_key or "")[-4:]
+            print(f"   - AI structured attempt {i+1}/{attempts}: model={model_name}, key=***{alias}")
             genai.configure(api_key=api_key)  # type: ignore[attr-defined]
-            model = genai.GenerativeModel(model_name)  # type: ignore[attr-defined]
-            combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-            response = model.generate_content(combined_prompt, generation_config=generation_config)  # type: ignore[arg-type]
+            model = genai.GenerativeModel(model_name, system_instruction=system_prompt)  # type: ignore[attr-defined]
+            response = model.generate_content(user_prompt, generation_config=generation_config)  # type: ignore[arg-type]
+            _accumulate_usage(response)
             text = _safe_response_text(response).strip()
             if not text:
                 raise RuntimeError("Empty AI response text")
@@ -443,6 +581,12 @@ def _ai_json_with_schema(
             transient = any(s in msg for s in ["500", "internal", "timeout", "deadline", "temporarily", "unavailable", "quota"]) or isinstance(e, TimeoutError)
             if i < attempts - 1 and transient:
                 sleep_s = (base_backoff ** i) * 2
+                try:
+                    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(e))
+                    if m:
+                        sleep_s = max(sleep_s, int(m.group(1)))
+                except Exception:
+                    pass
                 print(f"   -!- AI (structured) attempt {i+1} failed on {model_name}: {e}. Retrying in {int(sleep_s)}s...")
                 try:
                     time.sleep(sleep_s)
@@ -476,11 +620,20 @@ def generate_form_fill_plan(page_html: str, patient_data: dict) -> list:
     """Uses a Gemini chat session to generate a form-filling plan efficiently."""
     print("   - Asking AI to generate a form-filling plan (Model: gemini-2.5-flash)...")
     try:
+        # Try payer-specific cached plan first
+        payer_key = _normalize_payer_key(patient_data.get("payer_name", ""))
+        cached = _form_fill_cache.get(payer_key)
+        if cached:
+            print("   - Using cached form-fill plan for this payer.")
+            return cached
         system_prompt = SYSTEM_PROMPTS['form_filling']
         data_prompt = f"**Patient Data:**\n```json\n{json.dumps(patient_data, indent=2)}\n```\n\n**Form HTML:**\n```html\n{page_html}\n```"
         raw = _ai_text_with_retries(['gemini-2.5-flash','gemini-2.5-flash','gemini-2.5-pro'], system_prompt, data_prompt, attempts=3)
         cleaned_text = raw.strip().replace("```json", "").replace("```", "").strip()
         plan = json.loads(cleaned_text)
+        if payer_key:
+            _form_fill_cache[payer_key] = plan
+            _save_form_fill_cache()
         print("   - AI form-fill plan generated successfully.")
         return plan
     except Exception as e:
@@ -557,7 +710,7 @@ def get_all_report_data(html_content: str) -> dict:
     - Strengthens system prompt to strictly require JSON-only output.
     - Adds robust JSON extraction and diagnostics on repeated parse failure.
     """
-    print("   - Asking AI to generate all report data (Model: gemini-2.5-pro, strict JSON)...")
+    print("   - Asking AI to generate all report data (structured JSON with model fallback)...")
 
     sanitized_html = _sanitize_html_for_ai(html_content)
     # Save the exact sanitized HTML we send to AI for inspection
@@ -588,8 +741,7 @@ def get_all_report_data(html_content: str) -> dict:
                 "required": ["copay", "deductible", "coinsurance", "out_of_pocket"],
             },
         },
-        "required": ["status", "policy_begin", "policy_end", "summaries"],
-        "propertyOrdering": ["status", "policy_begin", "policy_end", "summaries"],
+        "required": ["status", "policy_begin", "policy_end", "summaries"]
     }
     try:
         user_prompt_struct = (
@@ -808,6 +960,13 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
     pdf_link = "N/A"
     # Enforce per-row timeout
     deadline_ts = time.time() + OPERATION_TIMEOUT_SECONDS if OPERATION_TIMEOUT_SECONDS > 0 else None
+    # Reset per-row AI token usage counters
+    try:
+        USAGE_TOKENS["prompt"] = 0
+        USAGE_TOKENS["candidates"] = 0
+        USAGE_TOKENS["total"] = 0
+    except Exception:
+        pass
     try:
         # (Form filling logic is unchanged)
         _check_timeout(deadline_ts)
@@ -925,6 +1084,12 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
         
         print(f"-> Check complete for {patient_data['first_name']}. Status: {final_results.get('status')}")
         logger.info(f"Result: name={patient_data.get('last_name','')},{patient_data.get('first_name','')} status={final_results.get('status')} payer={patient_data.get('payer_name','')} member={patient_data.get('member_id','')}")
+        # Print a compact per-row token usage summary
+        try:
+            print(f"   - AI token usage (this row): prompt={USAGE_TOKENS.get('prompt',0)}, candidates={USAGE_TOKENS.get('candidates',0)}, total={USAGE_TOKENS.get('total',0)}")
+            logger.info(f"AI tokens (row): prompt={USAGE_TOKENS.get('prompt',0)} candidates={USAGE_TOKENS.get('candidates',0)} total={USAGE_TOKENS.get('total',0)}")
+        except Exception:
+            pass
         return final_results
 
     except Exception as e:
@@ -938,7 +1103,12 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
                 pass
         
         screenshot_link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, screenshot_path, 'image/png')
-        
+        # Print a compact per-row token usage summary even on error
+        try:
+            print(f"   - AI token usage (this row): prompt={USAGE_TOKENS.get('prompt',0)}, candidates={USAGE_TOKENS.get('candidates',0)}, total={USAGE_TOKENS.get('total',0)}")
+            logger.info(f"AI tokens (row): prompt={USAGE_TOKENS.get('prompt',0)} candidates={USAGE_TOKENS.get('candidates',0)} total={USAGE_TOKENS.get('total',0)}")
+        except Exception:
+            pass
         return {
             "status": f"Error: {type(e).__name__}", "policy_begin": f"{e}", "policy_end": "",
             "copay": "N/A", "deductible": "N/A", "coinsurance": "N/A", "out_of_pocket": "N/A",
@@ -1000,6 +1170,8 @@ def main():
     print("-> Google Sheets & Drive authentication successful.")
     # Load payer cache once at startup
     _load_payer_cache()
+    # Load form-fill cache once at startup
+    _load_form_fill_cache()
 
     with sync_playwright() as p:
         context = None
