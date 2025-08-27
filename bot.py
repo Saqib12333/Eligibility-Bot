@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 import re
 import logging
 from logging.handlers import RotatingFileHandler
+from html import unescape
 
 # --- API KEY ROTATION SETUP ---
 load_dotenv() # Load variables from .env file
@@ -67,6 +68,8 @@ RUN_ONCE = str(os.getenv("RUN_ONCE", "False")).strip().lower() in ("1", "true", 
 HEADLESS = str(os.getenv("HEADLESS", "True")).strip().lower() in ("1", "true", "yes", "on")
 OPERATION_TIMEOUT_SECONDS = int(os.getenv("OPERATION_TIMEOUT_SECONDS", "300"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+REPORT_HTML_MAX_CHARS = int(os.getenv("REPORT_HTML_MAX_CHARS", "60000"))
+KEEP_BROWSER_OPEN = str(os.getenv("KEEP_BROWSER_OPEN", "False")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- File/Path Configuration ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -113,19 +116,18 @@ SYSTEM_PROMPTS = {
     2.  Return ONLY a JSON object with two keys: "category_text" (the exact text of the category link) and "payer_text" (the exact text of the final payer link).
     """,
     "report_generation": """
-    You are an expert data structuring engine for U.S. healthcare insurance reports. Your task is to transform the provided HTML into a single, comprehensive JSON object.
+    You are an expert data structuring engine for U.S. healthcare insurance reports. Transform the provided HTML into a single JSON object with only these fields:
 
-    OUTPUT FORMAT AND RULES (STRICT):
+    OUTPUT RULES (STRICT):
     - Respond with a single valid JSON object only. No markdown, no code fences, no commentary.
     - Use double quotes for all keys and string values. No trailing commas. No comments.
     - If a value is missing, use the string "Not Found". Do not invent data.
 
-    REQUIRED JSON SCHEMA:
+    REQUIRED FIELDS:
     - status: A specific coverage status like "Active Coverage" or "Inactive Coverage" (do not shorten to just "Active").
     - policy_begin: Policy start date string (or "Not Found").
     - policy_end: Policy end date string (or "Not Found").
     - summaries: Object with keys copay, deductible, coinsurance, out_of_pocket. Each value is a concise, newline-separated string summarizing relevant benefits.
-    - tables: Object whose keys are section names (e.g., "Co-Insurance"). Each value is a list of row objects, one per benefit line item. Do not concatenate multiple items into a single string.
     """
 }
 
@@ -159,7 +161,7 @@ def _check_timeout(deadline_ts: Optional[float] = None):
         raise TimeoutError("Operation timed out for this row.")
 
 # --- INPUT SANITIZATION FOR AI ---
-def _sanitize_html_for_ai(html: str, max_chars: int = 60000) -> str:
+def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> str:
     """Reduces noise and size of HTML before sending to the model.
 
     - Removes <script> and <style> blocks
@@ -215,6 +217,66 @@ def _extract_json_object(text: str) -> Optional[str]:
                     if stack == 0 and start != -1:
                         return text[start:i+1]
     return None
+
+def _fallback_parse_report(html: str) -> Dict[str, Any]:
+    """Lightweight DOM regex-based fallback to extract key fields when AI fails.
+
+    Returns a dict matching a subset of the JSON schema with safe defaults.
+    """
+    try:
+        text = unescape(html)
+        # Status: look for stsactive/inactive or text near title
+        status = "Not Found"
+        m = re.search(r"id=\"trnEligibilityStatus\"[^>]*>([^<]+)", text, re.IGNORECASE)
+        if m:
+            status = m.group(1).strip()
+        else:
+            m = re.search(r"Active Coverage|Inactive Coverage", text, re.IGNORECASE)
+            if m:
+                status = m.group(0)
+
+        # Plan dates
+        plan_begin = "Not Found"
+        plan_end = "Not Found"
+        mb = re.search(r"Plan\s*Begin\s*Date:\s*</dt>\s*<dd>([^<]+)</dd>", text, re.IGNORECASE)
+        if mb:
+            plan_begin = mb.group(1).strip()
+        me = re.search(r"Plan\s*End\s*Date:\s*</dt>\s*<dd>([^<]+)</dd>", text, re.IGNORECASE)
+        if me:
+            plan_end = me.group(1).strip()
+
+        # Summaries: naive snippets from tables
+        def _summary_for(keyword: str) -> str:
+            # Grab a small window around keyword occurrences
+            pat = re.compile(rf"<a[^>]*>\s*{re.escape(keyword)}\s*</a>[\s\S]*?<table[\s\S]*?</table>", re.IGNORECASE)
+            m = pat.search(text)
+            if not m:
+                return "Not Found"
+            snippet = re.sub(r"<[^>]+>", " ", m.group(0))
+            snippet = re.sub(r"\s+", " ", snippet).strip()
+            return snippet[:400]
+
+        summaries = {
+            "copay": _summary_for("Co-Payment"),
+            "deductible": _summary_for("Deductible"),
+            "coinsurance": _summary_for("Co-Insurance"),
+            "out_of_pocket": _summary_for("Out of Pocket|Out-of-Pocket"),
+        }
+
+        return {
+            "status": status,
+            "policy_begin": plan_begin,
+            "policy_end": plan_end,
+            "summaries": summaries,
+        }
+    except Exception as e:
+        logger.warning(f"Fallback parse failed: {e}")
+        return {
+            "status": "Not Found",
+            "policy_begin": "Not Found",
+            "policy_end": "Not Found",
+            "summaries": {"copay": "Not Found", "deductible": "Not Found", "coinsurance": "Not Found", "out_of_pocket": "Not Found"},
+        }
 
 # --- LOGIN HELPERS ---
 def _is_logged_in(page: Page) -> bool:
@@ -303,6 +365,93 @@ def make_ai_call_with_retry(chat_session, prompt_text, max_retries=3):
     # If all retries fail, raise the last exception
     raise Exception(f"AI call failed after {max_retries} retries.")
 
+def _ai_text_with_retries(model_names, system_prompt: str, user_prompt: str, attempts: int = 4, base_backoff: float = 1.5) -> str:
+    """Generate text from Gemini with retries, key rotation, and model fallback.
+
+    - Tries models in order from model_names for each attempt; last attempt will always use the last model.
+    - Rotates API keys on every attempt via get_next_api_key().
+    - Exponential backoff between attempts on transient errors (5xx, timeouts, empty response).
+    """
+    last_err = None
+    for i in range(attempts):
+        model_name = model_names[min(i, len(model_names) - 1)]
+        try:
+            api_key = get_next_api_key()
+            genai.configure(api_key=api_key)  # type: ignore[attr-defined]
+            model = genai.GenerativeModel(model_name)  # type: ignore[attr-defined]
+            chat = model.start_chat()
+            if system_prompt:
+                chat.send_message(system_prompt)
+            response = chat.send_message(user_prompt)
+            text = _safe_response_text(response).strip()
+            if not text:
+                raise RuntimeError("Empty AI response text")
+            return text
+        except Exception as e:
+            last_err = e
+            # Heuristic: transient if 5xx, internal error, timeout/deadline, or empty
+            msg = str(e).lower()
+            transient = any(s in msg for s in ["500", "internal", "timeout", "deadline", "temporarily", "unavailable"]) or isinstance(e, TimeoutError)
+            if i < attempts - 1 and transient:
+                # Exponential backoff with small jitter via base_backoff multiplier
+                sleep_s = (base_backoff ** i) * 2
+                print(f"   -!- AI attempt {i+1} failed on {model_name}: {e}. Retrying in {int(sleep_s)}s with rotated key/model...")
+                try:
+                    time.sleep(sleep_s)
+                except Exception:
+                    pass
+                continue
+            break
+    raise RuntimeError(f"AI text generation failed after {attempts} attempts: {last_err}")
+
+def _ai_json_with_schema(
+    model_names,
+    system_prompt: str,
+    user_prompt: str,
+    schema: Dict[str, Any],
+    attempts: int = 3,
+    base_backoff: float = 1.6,
+) -> Dict[str, Any]:
+    """Generate strict JSON from Gemini using response_schema.
+
+    Tries models with API key rotation and exponential backoff. Returns parsed JSON dict.
+    If the SDK/model doesn't support structured output or errors occur, raises RuntimeError.
+    """
+    last_err = None
+    generation_config = {
+        "response_mime_type": "application/json",
+        "response_schema": schema,
+    }
+    for i in range(attempts):
+        model_name = model_names[min(i, len(model_names) - 1)]
+        try:
+            api_key = get_next_api_key()
+            genai.configure(api_key=api_key)  # type: ignore[attr-defined]
+            model = genai.GenerativeModel(model_name)  # type: ignore[attr-defined]
+            combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+            response = model.generate_content(combined_prompt, generation_config=generation_config)  # type: ignore[arg-type]
+            text = _safe_response_text(response).strip()
+            if not text:
+                raise RuntimeError("Empty AI response text")
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise RuntimeError("Structured output was not a JSON object")
+            return data
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            transient = any(s in msg for s in ["500", "internal", "timeout", "deadline", "temporarily", "unavailable", "quota"]) or isinstance(e, TimeoutError)
+            if i < attempts - 1 and transient:
+                sleep_s = (base_backoff ** i) * 2
+                print(f"   -!- AI (structured) attempt {i+1} failed on {model_name}: {e}. Retrying in {int(sleep_s)}s...")
+                try:
+                    time.sleep(sleep_s)
+                except Exception:
+                    pass
+                continue
+            break
+    raise RuntimeError(f"AI structured JSON failed after {attempts} attempts: {last_err}")
+
 def upload_file_to_drive(drive_service, folder_id, file_path, mimetype):
     """Uploads a file to a specific Google Drive folder and returns its shareable link."""
     file_name = os.path.basename(file_path)
@@ -327,17 +476,9 @@ def generate_form_fill_plan(page_html: str, patient_data: dict) -> list:
     """Uses a Gemini chat session to generate a form-filling plan efficiently."""
     print("   - Asking AI to generate a form-filling plan (Model: gemini-2.5-flash)...")
     try:
-        api_key = get_next_api_key()
-        genai.configure(api_key=api_key)  # type: ignore[attr-defined]
-        model = genai.GenerativeModel('gemini-2.5-flash')  # type: ignore[attr-defined]
-
-        chat = model.start_chat()
-        chat.send_message(SYSTEM_PROMPTS['form_filling'])
-
+        system_prompt = SYSTEM_PROMPTS['form_filling']
         data_prompt = f"**Patient Data:**\n```json\n{json.dumps(patient_data, indent=2)}\n```\n\n**Form HTML:**\n```html\n{page_html}\n```"
-        # --- MODIFIED LINE: Using the retry function ---
-        response = make_ai_call_with_retry(chat, data_prompt)
-        raw = _safe_response_text(response)
+        raw = _ai_text_with_retries(['gemini-2.5-flash','gemini-2.5-flash','gemini-2.5-pro'], system_prompt, data_prompt, attempts=3)
         cleaned_text = raw.strip().replace("```json", "").replace("```", "").strip()
         plan = json.loads(cleaned_text)
         print("   - AI form-fill plan generated successfully.")
@@ -345,6 +486,68 @@ def generate_form_fill_plan(page_html: str, patient_data: dict) -> list:
     except Exception as e:
         print(f"   -!- CRITICAL: AI failed to generate a valid form-fill plan: {e}")
         return []
+
+def _try_fill_field(page: Page, label_candidates: list[str], value: str, timeout_ms: int = 2000) -> bool:
+    """Best-effort fill by trying common label and attribute strategies.
+
+    - Tries get_by_label on each candidate
+    - Falls back to placeholder/aria-label contains
+    - Tries input by id/name contains normalized tokens
+    Returns True if filled, else False.
+    """
+    def _safe_fill(locator_expr) -> bool:
+        try:
+            loc = locator_expr
+            loc.wait_for(state="visible", timeout=timeout_ms)
+            loc.scroll_into_view_if_needed()
+            page.wait_for_timeout(100)
+            loc.fill(value, timeout=timeout_ms)
+            return True
+        except Exception:
+            return False
+
+    # Try accessible labels
+    for lbl in label_candidates:
+        try:
+            loc = page.get_by_label(lbl, exact=False)
+            if _safe_fill(loc.first):
+                return True
+        except Exception:
+            pass
+
+    # Try placeholder or aria-label contains
+    for lbl in label_candidates:
+        try:
+            css = f"input[placeholder*='{lbl}'], input[aria-label*='{lbl}']"
+            loc = page.locator(css)
+            if _safe_fill(loc.first):
+                return True
+        except Exception:
+            pass
+
+    # Try id/name contains normalized tokens
+    tokens = []
+    for lbl in label_candidates:
+        tokens += re.split(r"\W+", lbl.lower())
+    tokens = [t for t in tokens if t]
+    if tokens:
+        try:
+            css = "input"
+            locs = page.locator(css)
+            count = locs.count()
+            for i in range(min(count, 50)):
+                el = locs.nth(i)
+                try:
+                    el_id = (el.get_attribute("id") or "").lower()
+                    el_name = (el.get_attribute("name") or "").lower()
+                    if any(t in el_id or t in el_name for t in tokens):
+                        if _safe_fill(el):
+                            return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return False
 
 def get_all_report_data(html_content: str) -> dict:
     """Uses Gemini to generate a single JSON object with all structured data from the report.
@@ -357,37 +560,115 @@ def get_all_report_data(html_content: str) -> dict:
     print("   - Asking AI to generate all report data (Model: gemini-2.5-pro, strict JSON)...")
 
     sanitized_html = _sanitize_html_for_ai(html_content)
-
-    def _prompt_once() -> str:
-        api_key = get_next_api_key()
-        genai.configure(api_key=api_key)  # type: ignore[attr-defined]
-        model = genai.GenerativeModel('gemini-2.5-pro')  # type: ignore[attr-defined]
-        chat = model.start_chat()
-        chat.send_message(SYSTEM_PROMPTS['report_generation'])
-        response = make_ai_call_with_retry(
-            chat,
-            (
-                "Return a single strictly valid JSON object as specified in the system instructions. "
-                "Do not include any text, explanations, or code fences before or after the JSON.\n\n"
-                f"HTML Content:\n{sanitized_html}"
-            ),
-        )
-        return _safe_response_text(response).strip()
-
-    # Attempt 1
+    # Save the exact sanitized HTML we send to AI for inspection
     try:
-        raw_text = _prompt_once()
+        ts_html = time.strftime("%Y%m%d-%H%M%S")
+        sanitized_path = os.path.join(logs_dir, f"report_html_sanitized_{ts_html}.html")
+        with open(sanitized_path, "w", encoding="utf-8") as f:
+            f.write(sanitized_html)
+        print(f"   - Saved sanitized report HTML to: {sanitized_path}")
+    except Exception:
+        pass
+
+    # First, try strict structured output using Gemini response_schema for a clean JSON object
+    schema = {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string"},
+            "policy_begin": {"type": "string"},
+            "policy_end": {"type": "string"},
+            "summaries": {
+                "type": "object",
+                "properties": {
+                    "copay": {"type": "string"},
+                    "deductible": {"type": "string"},
+                    "coinsurance": {"type": "string"},
+                    "out_of_pocket": {"type": "string"},
+                },
+                "required": ["copay", "deductible", "coinsurance", "out_of_pocket"],
+            },
+        },
+        "required": ["status", "policy_begin", "policy_end", "summaries"],
+        "propertyOrdering": ["status", "policy_begin", "policy_end", "summaries"],
+    }
+    try:
+        user_prompt_struct = (
+            "Return a single strictly valid JSON object as specified in the schema. "
+            "Do not include any text, explanations, or code fences before or after the JSON.\n\n"
+            f"HTML Content:\n{sanitized_html}"
+        )
+        models_struct = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-pro"]
+        data_struct = _ai_json_with_schema(models_struct, SYSTEM_PROMPTS['report_generation'], user_prompt_struct, schema, attempts=3)
+        # Save success raw JSON for observability
+        ts_succ = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            raw_ok_path = os.path.join(logs_dir, f"ai_report_raw_{ts_succ}.json")
+            with open(raw_ok_path, "w", encoding="utf-8") as f:
+                json.dump(data_struct, f, ensure_ascii=False, indent=2)
+            print(f"   - Saved AI report JSON to: {raw_ok_path}")
+            # Also persist the exact text for debugging if ever needed
+            raw_txt_path = os.path.join(logs_dir, f"ai_report_struct_raw_{ts_succ}.txt")
+            try:
+                with open(raw_txt_path, "w", encoding="utf-8") as tf:
+                    tf.write(json.dumps(data_struct, ensure_ascii=False, indent=2))
+            except Exception:
+                pass
+        except Exception as _:
+            pass
+        print("   - AI successfully generated consolidated report data (structured output).")
+        return data_struct
+    except Exception as struct_err:
+        print(f"   - Structured output not available or failed ({struct_err}). Falling back to text JSON prompt...")
+
+    def _prompt_with_retries() -> str:
+        system_prompt = SYSTEM_PROMPTS['report_generation']
+        user_prompt = (
+            "Return a single strictly valid JSON object as specified in the system instructions. "
+            "Do not include any text, explanations, or code fences before or after the JSON.\n\n"
+            f"HTML Content:\n{sanitized_html}"
+        )
+        # Try pro, then flash as fallback on later attempts
+        models = ['gemini-2.5-pro', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash']
+        return _ai_text_with_retries(models, system_prompt, user_prompt, attempts=4, base_backoff=1.8)
+
+    # Attempt 1 (text JSON prompt)
+    try:
+        raw_text = _prompt_with_retries()
         candidate = _extract_json_object(raw_text) or raw_text.replace("```json", "").replace("```", "").strip()
         try:
             data = json.loads(candidate)
+            # Save success raw JSON for observability
+            ts_succ = time.strftime("%Y%m%d-%H%M%S")
+            try:
+                raw_ok_path = os.path.join(logs_dir, f"ai_report_raw_{ts_succ}.json")
+                with open(raw_ok_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                print(f"   - Saved AI report JSON to: {raw_ok_path}")
+                raw_txt_path = os.path.join(logs_dir, f"ai_report_text_raw_{ts_succ}.txt")
+                with open(raw_txt_path, "w", encoding="utf-8") as tf:
+                    tf.write(raw_text)
+            except Exception:
+                pass
             print("   - AI successfully generated consolidated report data.")
             return data
         except Exception as parse_err:
             print(f"   -!- JSON parse failed (attempt 1), retrying once: {parse_err}")
             time.sleep(2)
-            raw_text = _prompt_once()
+            raw_text = _prompt_with_retries()
             candidate = _extract_json_object(raw_text) or raw_text.replace("```json", "").replace("```", "").strip()
             data = json.loads(candidate)
+            # Save success raw JSON for observability (retry)
+            ts_succ = time.strftime("%Y%m%d-%H%M%S")
+            try:
+                raw_ok_path = os.path.join(logs_dir, f"ai_report_raw_{ts_succ}.json")
+                with open(raw_ok_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                print(f"   - Saved AI report JSON to: {raw_ok_path}")
+                raw_txt_path = os.path.join(logs_dir, f"ai_report_text_raw_{ts_succ}.txt")
+                with open(raw_txt_path, "w", encoding="utf-8") as tf:
+                    tf.write(raw_text)
+            except Exception:
+                pass
             print("   - AI successfully generated consolidated report data (retry).")
             return data
     except Exception as e:
@@ -403,13 +684,19 @@ def get_all_report_data(html_content: str) -> dict:
             print(f"   -!- Diagnostics written to: {diag_json_path} and {diag_html_path}")
         except Exception as diag_err:
             print(f"   -!- Failed to write diagnostics: {diag_err}")
-        print(f"   -!- AI failed to generate consolidated JSON after retry: {e}")
-        return {"Error": f"Failed to parse report: {e}"}
+        print(f"   -!- AI failed to generate consolidated JSON after retry: {e}. Falling back to DOM parsing...")
+        # Fallback best-effort parse from DOM
+        try:
+            fallback = _fallback_parse_report(html_content)
+            return fallback
+        except Exception:
+            return {"Error": f"Failed to parse report: {e}"}
 
-def select_payer_with_ai(page: Page, payer_name: str):
+def select_payer_with_ai(page: Page, payer_name: str, deadline_ts: Optional[float] = None):
     """Uses a Gemini chat session to find and select the correct payer."""
-    print("   - Starting AI-powered payer selection (Model: gemini-2.5-flash)...")
+    print("   - Selecting Payer...")
     try:
+        _check_timeout(deadline_ts)
         page.goto("https://mytools.gatewayedi.com/ManagePatients/RealTimeEligibility/Index", wait_until="domcontentloaded")
         payer_list_container = page.locator("#InsurerAccordion")
         payer_list_container.wait_for(state="visible", timeout=30000)
@@ -422,61 +709,93 @@ def select_payer_with_ai(page: Page, payer_name: str):
             print("   - Using cached payer selection plan.")
         else:
             print("   - Asking AI to find the best payer match and create a plan...")
-            api_key = get_next_api_key()
-            genai.configure(api_key=api_key)  # type: ignore[attr-defined]
-            model = genai.GenerativeModel('gemini-2.5-flash')  # type: ignore[attr-defined]
+            _check_timeout(deadline_ts)
+            # Try AI plan with retries and key rotation
+            system_prompt = SYSTEM_PROMPTS['payer_selection']
+            user_prompt = f"The user wants to select: **\"{payer_name}\"**.\n\n**Payer List HTML:**\n```html\n{list_html}\n```"
+            try:
+                raw = _ai_text_with_retries(['gemini-2.5-flash','gemini-2.5-flash','gemini-2.5-pro'], system_prompt, user_prompt, attempts=3)
+                cleaned_text = raw.strip().replace("```json", "").replace("```", "").strip()
+                plan = json.loads(cleaned_text)
+            except Exception as ai_err:
+                print(f"   -!- AI payer planning failed ({ai_err}). Falling back to substring search...")
+                plan = None
+            if isinstance(plan, dict) and "category_text" in plan and "payer_text" in plan:
+                _payer_cache[key] = {"category_text": plan["category_text"], "payer_text": plan["payer_text"]}
+                _save_payer_cache()
 
-            chat = model.start_chat()
-            chat.send_message(SYSTEM_PROMPTS['payer_selection'])
-
-            data_prompt = f"The user wants to select: **\"{payer_name}\"**.\n\n**Payer List HTML:**\n```html\n{list_html}\n```"
-            response = make_ai_call_with_retry(chat, data_prompt)
-            raw = _safe_response_text(response)
-            cleaned_text = raw.strip().replace("```json", "").replace("```", "").strip()
-            plan = json.loads(cleaned_text)
-            _payer_cache[key] = {"category_text": plan["category_text"], "payer_text": plan["payer_text"]}
-            _save_payer_cache()
-
-        print(f"   - AI Plan Received. Category: '{plan['category_text']}', Payer: '{plan['payer_text']}'")
+        if plan:
+            print(f"   - AI Plan Received. Category: '{plan['category_text']}', Payer: '{plan['payer_text']}'")
 
         # Expand category and wait for nested list
-        category_element = page.get_by_text(plan['category_text'], exact=True).first
-        category_element.scroll_into_view_if_needed()
-        # Predefine nested_list to avoid unbound variable
-        nested_list = page.locator(f"li[id='{plan['category_text']}'] ul.insurersDetail")
-        for _ in range(2):
-            category_element.click()
-            page.wait_for_timeout(500)
-            if nested_list.is_visible():
-                break
-        nested_list.wait_for(state="visible", timeout=15000)
-
-        # Try exact link with retries and scroll, then fallback non-exact
         clicked = False
-        for attempt in range(4):
+        if plan:
+            # Planned path using category then payer
+            _check_timeout(deadline_ts)
+            category_element = page.get_by_text(plan['category_text'], exact=True).first
+            category_element.scroll_into_view_if_needed()
+            nested_list = page.locator(f"li[id='{plan['category_text']}'] ul.insurersDetail")
+            for _ in range(2):
+                category_element.click()
+                page.wait_for_timeout(500)
+                if nested_list.is_visible():
+                    break
             try:
-                payer_link = nested_list.get_by_text(plan['payer_text'], exact=True).first
-                payer_link.scroll_into_view_if_needed()
-                # If link looks disabled, give it a moment to enable
+                nested_list.wait_for(state="visible", timeout=15000)
+            except Exception:
+                pass
+            for attempt in range(4):
                 try:
-                    cls = payer_link.get_attribute("class") or ""
-                    if "disabled" in cls:
-                        page.wait_for_timeout(300)
+                    _check_timeout(deadline_ts)
+                    payer_link = nested_list.get_by_text(plan['payer_text'], exact=True).first
+                    payer_link.scroll_into_view_if_needed()
+                    try:
+                        cls = payer_link.get_attribute("class") or ""
+                        if "disabled" in cls:
+                            page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(150 + attempt * 200)
+                    payer_link.click(timeout=5000)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                try:
+                    _check_timeout(deadline_ts)
+                    fallback_link = nested_list.get_by_text(plan.get('payer_text',''), exact=False).first
+                    fallback_link.scroll_into_view_if_needed()
+                    page.wait_for_timeout(250)
+                    fallback_link.click(timeout=6000)
+                    clicked = True
                 except Exception:
                     pass
-                page.wait_for_timeout(150 + attempt * 200)
-                payer_link.click(timeout=5000)
-                clicked = True
-                break
-            except Exception:
-                continue
         if not clicked:
-            fallback_link = nested_list.get_by_text(plan['payer_text'], exact=False).first
-            fallback_link.scroll_into_view_if_needed()
-            page.wait_for_timeout(250)
-            fallback_link.click(timeout=6000)
+            # Heuristic fallback: expand visible categories and click first link containing payer name
+            try:
+                _check_timeout(deadline_ts)
+                headers = payer_list_container.locator("li > a").all()
+                for h in headers:
+                    try:
+                        h.scroll_into_view_if_needed()
+                        h.click()
+                        page.wait_for_timeout(150)
+                    except Exception:
+                        continue
+                guess_link = payer_list_container.locator("a", has_text=payer_name).first
+                guess_link.scroll_into_view_if_needed()
+                page.wait_for_timeout(200)
+                guess_link.click(timeout=6000)
+                clicked = True
+                print("   - Fallback payer selection (substring) succeeded.")
+            except Exception as fb_err:
+                print(f"   -!- Fallback payer selection failed: {fb_err}")
+                clicked = False
 
         page.wait_for_timeout(1200)
+        if not clicked:
+            raise RuntimeError("Unable to select payer via AI or fallback heuristics")
         print(f"   - AI Payer Selection for '{payer_name}' successful.")
 
     except Exception as e:
@@ -497,8 +816,39 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
         if not fill_plan:
             raise ValueError("AI did not return a valid form-filling plan.")
         print("   - Executing AI form-filling plan...")
+        # Field mapping to support fallback matching by semantic name
+        field_hints = {
+            "dos": ["Date of Service", "Service Date", "DOS", "Start Date"],
+            "member_id": ["Subscriber ID", "Member ID", "Subscriber Number", "Policy Number", "ID"],
+            "first_name": ["First Name", "Subscriber First Name"],
+            "last_name": ["Last Name", "Subscriber Last Name"],
+            "dob": ["Date of Birth", "DOB", "Birth Date"],
+        }
+        # Attempt to execute plan; on failure per step, fallback to label-based fill
         for step in fill_plan:
-            page.locator(step['selector']).fill(step['value'])
+            sel = step.get('selector', '')
+            val = step.get('value', '')
+            try:
+                loc = page.locator(sel)
+                loc.wait_for(state="visible", timeout=2000)
+                loc.scroll_into_view_if_needed()
+                page.wait_for_timeout(100)
+                loc.fill(val, timeout=2000)
+            except Exception:
+                # Guess the field by matching value to patient_data, then use label-based fallback
+                matched_key = None
+                for k in ["dos", "member_id", "first_name", "last_name", "dob"]:
+                    if str(patient_data.get(k, "")) == str(val):
+                        matched_key = k
+                        break
+                if matched_key:
+                    if _try_fill_field(page, field_hints[matched_key], val):
+                        continue
+                # As a last resort, try all hint groups with the provided value
+                all_labels = sum(field_hints.values(), [])
+                if _try_fill_field(page, all_labels, val):
+                    continue
+                raise
         print("   - Form filled according to AI plan.")
         _check_timeout(deadline_ts)
         page.locator("#btnUploadButton").click()
@@ -720,7 +1070,9 @@ def main():
 
                     sheet.update_cell(row_index_to_process, 7, "Processing...")
 
-                    select_payer_with_ai(page, current_payer)
+                    # Set a per-row deadline and pass to payer selection
+                    deadline_ts = time.time() + OPERATION_TIMEOUT_SECONDS if OPERATION_TIMEOUT_SECONDS > 0 else None
+                    select_payer_with_ai(page, current_payer, deadline_ts)
 
                     patient_data = {
                         "dos": row_to_process[0], "first_name": row_to_process[1],
@@ -766,6 +1118,12 @@ def main():
 
         # End-of-run summary
         logger.info(f"Summary: processed={PROCESSED_COUNT} ok={OK_COUNT} fail={FAIL_COUNT} retried={RETRIED_COUNT}")
+        # Optionally keep the browser open for review
+        if KEEP_BROWSER_OPEN:
+            try:
+                input("\nPress Enter to close the browser and exit...")
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

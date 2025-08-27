@@ -2,6 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+copilot.instructions.md
 
 # C extensions
 *.so
