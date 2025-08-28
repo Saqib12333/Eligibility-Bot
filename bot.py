@@ -74,6 +74,8 @@ OPERATION_TIMEOUT_SECONDS = int(os.getenv("OPERATION_TIMEOUT_SECONDS", "300"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 REPORT_HTML_MAX_CHARS = int(os.getenv("REPORT_HTML_MAX_CHARS", "100000"))
 KEEP_BROWSER_OPEN = str(os.getenv("KEEP_BROWSER_OPEN", "False")).strip().lower() in ("1", "true", "yes", "on")
+# Choose which artifact to send to Gemini for report parsing: 'pdf' (default) or 'html'
+AI_REPORT_INPUT = (os.getenv("AI_REPORT_INPUT", "pdf") or "pdf").strip().lower()
 
 # --- File/Path Configuration ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -220,6 +222,85 @@ SYSTEM_PROMPTS = {
     - summaries: Object with keys copay, deductible, coinsurance, out_of_pocket. Each value is a concise, newline-separated string summarizing relevant benefits.
     """
 }
+
+# --- PDF REPORT PARSING (structured output) ---
+def get_all_report_data_from_pdf(pdf_path: str, patient_base_name: str) -> dict:
+    """Parses the eligibility report directly from a PDF using Gemini structured output.
+
+    Returns a dict with the same schema as HTML parsing.
+    """
+    print("   - Asking AI to generate all report data from PDF (structured JSON)...")
+    # Schema identical to HTML path
+    schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string"},
+            "policy_begin": {"type": "string"},
+            "policy_end": {"type": "string"},
+            "summaries": {
+                "type": "object",
+                "properties": {
+                    "copay": {"type": "string"},
+                    "deductible": {"type": "string"},
+                    "coinsurance": {"type": "string"},
+                    "out_of_pocket": {"type": "string"},
+                },
+                "required": ["copay", "deductible", "coinsurance", "out_of_pocket"],
+            },
+        },
+        "required": ["status", "policy_begin", "policy_end", "summaries"],
+    }
+
+    generation_config = {"response_mime_type": "application/json", "response_schema": schema}
+    last_err: Optional[Exception] = None
+    # Try pro, fallback to flash on last attempt
+    models = ["gemini-2.5-pro", "gemini-2.5-pro", "gemini-2.5-flash"]
+    for i, model_name in enumerate(models):
+        try:
+            api_key = get_next_api_key()
+            alias = (api_key or "")[-4:]
+            print(f"   - AI structured (PDF) attempt {i+1}/{len(models)}: model={model_name}, key=***{alias}")
+            genai.configure(api_key=api_key)  # type: ignore[attr-defined]
+            pdf_file = genai.upload_file(pdf_path)  # type: ignore[attr-defined]
+            model = genai.GenerativeModel(model_name, system_instruction=SYSTEM_PROMPTS["report_generation"])  # type: ignore[attr-defined]
+            response = model.generate_content(
+                [pdf_file, "Return a single strictly valid JSON object as specified in the schema."],
+                generation_config=generation_config,  # type: ignore[arg-type]
+            )
+            _accumulate_usage(response)
+            text = _safe_response_text(response).strip()
+            if not text:
+                raise RuntimeError("Empty AI response text")
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise RuntimeError("Structured output was not a JSON object")
+            # Save artifacts (JSON) to AI Response using firstname_lastname
+            try:
+                ai_dir = os.path.join(logs_dir, "AI Response")
+                os.makedirs(ai_dir, exist_ok=True)
+                out_path = os.path.join(ai_dir, f"{patient_base_name}.json")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                print(f"   - Saved AI report JSON to: {out_path}")
+            except Exception:
+                pass
+            print("   - AI successfully generated consolidated report data from PDF.")
+            return data
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            transient = any(s in msg for s in ["500", "internal", "timeout", "deadline", "temporarily", "unavailable", "quota"]) or isinstance(e, TimeoutError)
+            if i < len(models) - 1 and transient:
+                # backoff similar to HTML path
+                sleep_s = (1.6 ** i) * 2
+                print(f"   -!- AI (structured PDF) attempt {i+1} failed on {model_name}: {e}. Retrying in {int(sleep_s)}s...")
+                try:
+                    time.sleep(sleep_s)
+                except Exception:
+                    pass
+                continue
+            break
+    raise RuntimeError(f"AI structured JSON from PDF failed: {last_err}")
 
 # --- PAYER PLAN CACHE ---
 _payer_cache: Dict[str, Dict[str, str]] = {}
@@ -1368,20 +1449,40 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
         except Exception:
             pass
 
-        # --- NEW: SINGLE, CONSOLIDATED AI CALL ---
+        # --- NEW: SINGLE, CONSOLIDATED AI CALL (with PDF/HTML switch) ---
         _check_timeout(deadline_ts)
-        all_data = get_all_report_data(report_html, patient_base_name)
+        all_data: Dict[str, Any]
+        pdf_path_for_ai: Optional[str] = None
+        # If using PDF, create once up-front for parsing and later upload reuse
+        if AI_REPORT_INPUT == "pdf":
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            pdf_path_for_ai = save_current_page_pdf(page, SCRIPT_DIR, f"{patient_data['last_name']}_{patient_data['first_name']}")
+            if pdf_path_for_ai and os.path.exists(pdf_path_for_ai):
+                try:
+                    all_data = get_all_report_data_from_pdf(pdf_path_for_ai, patient_base_name)
+                except Exception as pdf_err:
+                    print(f"   -!- PDF parsing failed ({pdf_err}). Falling back to sanitized HTML...")
+                    all_data = get_all_report_data(report_html, patient_base_name)
+            else:
+                print("   -!- PDF was not created; using sanitized HTML for parsing.")
+                all_data = get_all_report_data(report_html, patient_base_name)
+        else:
+            # Explicit HTML path
+            all_data = get_all_report_data(report_html, patient_base_name)
         if "Error" in all_data:
             raise ValueError(all_data["Error"])
 
         patient_name_str = f"{patient_data['last_name']}_{patient_data['first_name']}"
-        # --- Save and upload PDF instead of screenshot ---
+        # --- Save and upload PDF (reuse earlier one if available) ---
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
         _check_timeout(deadline_ts)
-        pdf_path = save_current_page_pdf(page, SCRIPT_DIR, patient_name_str)
+        pdf_path = pdf_path_for_ai or save_current_page_pdf(page, SCRIPT_DIR, patient_name_str)
         if pdf_path and os.path.exists(pdf_path):
             pdf_link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, pdf_path, 'application/pdf')
         else:
