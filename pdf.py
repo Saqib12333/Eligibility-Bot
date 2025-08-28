@@ -27,29 +27,22 @@ def save_current_page_pdf(page, base_dir: str, patient_name: str, subdir: str = 
         pdf_dir = os.path.join(base_dir, subdir)
         os.makedirs(pdf_dir, exist_ok=True)
 
-        # Try to trigger the print view to ensure print CSS applies if needed
+        # Avoid clicking any print button that could open a blocking dialog; use CDP printToPDF directly
         try:
-            # If there is an explicit print button present, click it; otherwise rely on printToPDF
-            btn = page.locator('#exportPrint')
-            if btn and btn.count() > 0:
-                try:
-                    btn.first.scroll_into_view_if_needed()
-                    page.wait_for_timeout(150)
-                    btn.first.click(timeout=2000)
-                    page.wait_for_timeout(500)
-                except Exception:
-                    pass
+            page.emulate_media(media="print")
         except Exception:
             pass
 
         # Use CDP session for printToPDF (Chromium only)
         client = page.context.new_cdp_session(page)
         # Prefer A4 portrait, scale down slightly to fit; print backgrounds true for styling
+        # Keep options conservative to avoid large files and hangs
         result = client.send('Page.printToPDF', {
             'printBackground': True,
             'preferCSSPageSize': True,
             'scale': 0.95,
             'landscape': False,
+            'transferMode': 'ReturnAsBase64'
         })
 
         pdf_base64 = result.get('data')
@@ -58,10 +51,6 @@ def save_current_page_pdf(page, base_dir: str, patient_name: str, subdir: str = 
 
         safe_name = sanitize_filename(patient_name or f"report_{time.strftime('%Y%m%d-%H%M%S')}")
         pdf_path = os.path.join(pdf_dir, f"{safe_name}.pdf")
-        with open(pdf_path, 'wb') as f:
-            f.write(bytes.fromhex(''))  # no-op to ensure file creation on some FS before write
-            f.write(bytes.fromhex(''))
-        # Write actual content
         with open(pdf_path, 'wb') as f:
             f.write(__import__('base64').b64decode(pdf_base64))
 

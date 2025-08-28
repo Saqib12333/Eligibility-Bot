@@ -681,23 +681,127 @@ def generate_form_fill_plan(page_html: str, patient_data: dict) -> list:
         payer_key = _normalize_payer_key(patient_data.get("payer_name", ""))
         cached = _form_fill_cache.get(payer_key)
         if cached:
+            # Personalize cached placeholder plan with current patient's values
             print("   - Using cached form-fill plan for this payer.")
-            return cached
+            try:
+                allowed_keys = {"dos", "member_id", "first_name", "last_name", "dob"}
+
+                def _norm_placeholder_token(s: str) -> Optional[str]:
+                    if not isinstance(s, str):
+                        return None
+                    raw = s.strip()
+                    low = raw.lower()
+                    # Strip common wrapper syntaxes like {{key}}, ${key}, <<key>>
+                    low = re.sub(r"^\{\{\s*|\}\}$", "", low)
+                    low = re.sub(r"^\$\{\s*|\}$", "", low)
+                    low = re.sub(r"^<<\s*|\s*>>$", "", low)
+                    low = low.strip()
+                    # Map synonyms to canonical keys
+                    synonyms = {
+                        "dos": "dos",
+                        "date_of_service": "dos",
+                        "service_date": "dos",
+                        "start_date": "dos",
+                        "visit_date": "dos",
+                        "dob": "dob",
+                        "date_of_birth": "dob",
+                        "birth_date": "dob",
+                        "member_id": "member_id",
+                        "subscriber_id": "member_id",
+                        "policy_number": "member_id",
+                        "id": "member_id",
+                        "first_name": "first_name",
+                        "subscriber_first_name": "first_name",
+                        "last_name": "last_name",
+                        "subscriber_last_name": "last_name",
+                    }
+                    return synonyms.get(low)
+                personalized = []
+                for step in cached:
+                    sel = step.get("selector", "")
+                    val = step.get("value", "")
+                    key = _norm_placeholder_token(val)
+                    if key in allowed_keys:
+                        personalized.append({"selector": sel, "value": str(patient_data.get(key, ""))})
+                    else:
+                        personalized.append(step)
+                return personalized
+            except Exception:
+                return cached
         system_prompt = SYSTEM_PROMPTS['form_filling']
         data_prompt = f"**Patient Data:**\n```json\n{json.dumps(patient_data, indent=2)}\n```\n\n**Form HTML:**\n```html\n{page_html}\n```"
         raw = _ai_text_with_retries(['gemini-2.5-flash','gemini-2.5-flash','gemini-2.5-pro'], system_prompt, data_prompt, attempts=3)
         cleaned_text = raw.strip().replace("```json", "").replace("```", "").strip()
         plan = json.loads(cleaned_text)
+        # Save a placeholder-based version to cache so values are not hard-coded
         if payer_key:
-            _form_fill_cache[payer_key] = plan
-            _save_form_fill_cache()
+            try:
+                reverse_map = {}
+                # Build reverse map from value string -> key
+                def _normalized_date_variants(s: str) -> List[str]:
+                    s = s.strip()
+                    outs = {s}
+                    # Normalize common separators and leading zeros for mm/dd/yyyy
+                    m = re.match(r"^(\d{1,4})[\-/\.](\d{1,2})[\-/\.](\d{1,4})$", s)
+                    if m:
+                        a, b, c = m.group(1), m.group(2), m.group(3)
+                        # Try to detect year position (YYYY first or last)
+                        if len(a) == 4:
+                            y, mm, dd = a, b.zfill(2), c.zfill(2)
+                        elif len(c) == 4:
+                            y, mm, dd = c, a.zfill(2), b.zfill(2)
+                        else:
+                            y, mm, dd = c, a.zfill(2), b.zfill(2)
+                        outs.add(f"{mm}/{dd}/{y}")
+                        outs.add(f"{int(mm)}/{int(dd)}/{y}")
+                        outs.add(f"{y}-{mm}-{dd}")
+                    return list(outs)
+
+                for k in ["dos", "member_id", "first_name", "last_name", "dob"]:
+                    v = str(patient_data.get(k, "")).strip()
+                    if not v:
+                        continue
+                    # Map raw
+                    reverse_map[v] = k
+                    # Map normalized variants for dates
+                    if k in ("dos", "dob"):
+                        for vv in _normalized_date_variants(v):
+                            reverse_map[vv] = k
+                cached_plan = []
+                for step in plan:
+                    sel = step.get("selector", "")
+                    val = str(step.get("value", "")).strip()
+                    key = reverse_map.get(val)
+                    if not key:
+                        # Infer by selector heuristics if value match failed (useful for DOS/DOB mismatched formatting)
+                        low_sel = sel.lower()
+                        if any(tok in low_sel for tok in ["dos", "service", "svc", "startdate", "servicedate"]):
+                            key = "dos"
+                        elif any(tok in low_sel for tok in ["dob", "birth", "birthdate", "dateofbirth"]):
+                            key = "dob"
+                        elif any(tok in low_sel for tok in ["member", "subscriber", "policy", "subid", "memberid"]):
+                            key = "member_id"
+                        elif any(tok in low_sel for tok in ["first", "fname", "firstname"]):
+                            key = "first_name"
+                        elif any(tok in low_sel for tok in ["last", "lname", "lastname", "surname"]):
+                            key = "last_name"
+                    if key:
+                        cached_plan.append({"selector": sel, "value": key})
+                    else:
+                        cached_plan.append({"selector": sel, "value": val})
+                _form_fill_cache[payer_key] = cached_plan
+                _save_form_fill_cache()
+            except Exception:
+                # On any error, fall back to caching raw plan (better than nothing)
+                _form_fill_cache[payer_key] = plan
+                _save_form_fill_cache()
         print("   - AI form-fill plan generated successfully.")
         return plan
     except Exception as e:
         print(f"   -!- CRITICAL: AI failed to generate a valid form-fill plan: {e}")
         return []
 
-def _try_fill_field(page: Page, label_candidates: list[str], value: str, timeout_ms: int = 2000) -> bool:
+def _try_fill_field(page: Page, label_candidates: list[str], value: str, timeout_ms: int = 2000, is_date: bool = False) -> bool:
     """Best-effort fill by trying common label and attribute strategies.
 
     - Tries get_by_label on each candidate
@@ -705,14 +809,75 @@ def _try_fill_field(page: Page, label_candidates: list[str], value: str, timeout
     - Tries input by id/name contains normalized tokens
     Returns True if filled, else False.
     """
+    def _date_variants(v: str) -> List[str]:
+        v = (v or "").strip()
+        outs = []
+        # normalize digits
+        m = re.match(r"^(\d{1,4})[\-/\. ](\d{1,2})[\-/\. ](\d{1,4})$", v)
+        if m:
+            a, b, c = m.group(1), m.group(2), m.group(3)
+            if len(a) == 4:
+                y, mm, dd = a, b.zfill(2), c.zfill(2)
+            elif len(c) == 4:
+                y, mm, dd = c, a.zfill(2), b.zfill(2)
+            else:
+                y, mm, dd = c, a.zfill(2), b.zfill(2)
+            outs += [f"{mm}/{dd}/{y}", f"{int(mm)}/{int(dd)}/{y}", f"{y}-{mm}-{dd}", f"{mm}{dd}{y}"]
+        # prefer original first
+        return [v] + [x for x in outs if x != v]
+
     def _safe_fill(locator_expr) -> bool:
         try:
             loc = locator_expr
             loc.wait_for(state="visible", timeout=timeout_ms)
             loc.scroll_into_view_if_needed()
             page.wait_for_timeout(100)
-            loc.fill(value, timeout=timeout_ms)
-            return True
+            # Handle date specifics
+            if is_date:
+                # Try type=date format first if applicable
+                try:
+                    t = (loc.get_attribute("type") or "").lower()
+                except Exception:
+                    t = ""
+                for candidate in _date_variants(value):
+                    try:
+                        cand = candidate
+                        if t == "date":
+                            # Expect yyyy-mm-dd
+                            m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", candidate)
+                            if m:
+                                cand = f"{m.group(3)}-{m.group(1).zfill(2)}-{m.group(2).zfill(2)}"
+                        loc.fill(cand, timeout=timeout_ms)
+                        # Verify
+                        try:
+                            iv = loc.input_value(timeout=timeout_ms) or (loc.get_attribute("value") or "")
+                        except Exception:
+                            iv = loc.get_attribute("value") or ""
+                        if iv and (cand in iv or re.sub(r"\D", "", cand) == re.sub(r"\D", "", iv)):
+                            return True
+                        # Try sequential typing for masked fields
+                        loc.fill("")
+                        loc.press_sequentially(cand, delay=50)
+                        try:
+                            iv = loc.input_value(timeout=timeout_ms) or (loc.get_attribute("value") or "")
+                        except Exception:
+                            iv = loc.get_attribute("value") or ""
+                        if iv and (cand in iv or re.sub(r"\D", "", cand) == re.sub(r"\D", "", iv)):
+                            return True
+                    except Exception:
+                        continue
+                return False
+            else:
+                loc.fill(value, timeout=timeout_ms)
+                # Verify basic fill took effect; if not, try sequential typing
+                try:
+                    iv = loc.input_value(timeout=timeout_ms) or (loc.get_attribute("value") or "")
+                except Exception:
+                    iv = loc.get_attribute("value") or ""
+                if not iv or (len(value) > 0 and value not in iv and re.sub(r"\W", "", value) != re.sub(r"\W", "", iv)):
+                    loc.fill("")
+                    loc.press_sequentially(str(value), delay=50)
+                return True
         except Exception:
             return False
 
@@ -1058,16 +1223,38 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
                         matched_key = k
                         break
                 if matched_key:
-                    if _try_fill_field(page, field_hints[matched_key], val):
+                    is_date = matched_key in ("dos", "dob")
+                    if _try_fill_field(page, field_hints[matched_key], val, is_date=is_date):
                         continue
                 # As a last resort, try all hint groups with the provided value
                 all_labels = sum(field_hints.values(), [])
-                if _try_fill_field(page, all_labels, val):
+                # Heuristic: decide if looks like a date
+                looks_like_date = bool(re.match(r"\d{1,4}[\-/\. ]\d{1,2}[\-/\. ]\d{1,4}", str(val)))
+                if _try_fill_field(page, all_labels, val, is_date=looks_like_date):
                     continue
                 raise
         print("   - Form filled according to AI plan.")
         _check_timeout(deadline_ts)
-        page.locator("#btnUploadButton").click()
+        # Submit: click label if visible; otherwise fallback to real input or JS click
+        try:
+            btn_label = page.locator("#btnUploadButton")
+            btn_label.scroll_into_view_if_needed()
+            btn_label.wait_for(state="visible", timeout=2000)
+            btn_label.click()
+        except Exception:
+            try:
+                btn_input = page.locator("#btnUpload")
+                btn_input.scroll_into_view_if_needed()
+                btn_input.click()
+            except Exception:
+                try:
+                    page.evaluate("() => { const el = document.getElementById('btnUpload'); if(el) el.click(); }")
+                except Exception:
+                    # As a last resort, try clicking any visible green submit near form area
+                    try:
+                        page.locator("label.btn_green, .btn_green").first.click()
+                    except Exception:
+                        raise
         page.wait_for_selector("#eligibilityRequestResponse, #EligibilityValidationErrors", timeout=90000)
         error_div = page.locator("#EligibilityValidationErrors")
         if error_div.is_visible() and len(error_div.inner_text().strip()) > 0:
