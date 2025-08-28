@@ -20,6 +20,7 @@ import re
 import logging
 from logging.handlers import RotatingFileHandler
 from html import unescape
+from pdf import save_current_page_pdf
 
 # --- API KEY ROTATION SETUP ---
 load_dotenv() # Load variables from .env file
@@ -241,7 +242,7 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
     Keep:
     - <h1 id="trnEligibilityStatus">...</h1>
     - <div id="BasicProfile"> (prefer only Plan Begin/End rows)
-    - Benefit sections + tables for: Co-Payment, Co-Insurance, Deductible, Out of Pocket
+    - Benefit sections + tables for: Co-Payment, Co-Insurance, Deductible, Out of Pocket (including common label variants)
 
     Otherwise remove scripts/styles/comments, collapse whitespace, and truncate.
     Fallback to base cleanup if targeted extraction fails.
@@ -254,6 +255,7 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
         raw = re.sub(r"<!--([\s\S]*?)-->", " ", raw)
 
         pieces: List[str] = []
+        seen_table_ids: set[str] = set()
         # 1) Eligibility Status
         m = re.search(r"<h1[^>]*id=\"trnEligibilityStatus\"[^>]*>\s*([\s\S]*?)\s*</h1>", raw, re.IGNORECASE)
         if m:
@@ -273,22 +275,77 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
             else:
                 pieces.append(bp)
 
-        # 3) Benefits sections of interest
-        section_labels = [
+        # 3) Benefits sections of interest (broadened matching, fewer structure assumptions)
+        # Core labels
+        core_labels = [
             "Co-Payment",
             "Co-Insurance",
             "Deductible",
+        ]
+        # OOP variants
+        oop_variants = [
             "Out of Pocket",
             "Out-of-Pocket",
+            "Maximum Out of Pocket",
+            "Out-of-Pocket Maximum",
+            "Out of Pocket Maximum",
+            "Out-of-Pocket Limit",
+            "Out of Pocket Limit",
+            "Out-of-Pocket Expenses",
+            "Out of Pocket Expenses",
+            "Out-of-Pocket Accumulators",
+            "Out of Pocket Accumulators",
+            "OOP Max",
+            "OOP Maximum",
+            "MOOP",
         ]
-        for lab in section_labels:
-            pat = re.compile(
-                rf"<a[^>]*class=\"sections[^\"]*\"[^>]*>\s*{lab}\s*</a>[\s\S]*?(<div[^>]*id=\"BenefitsTable\d+\"[\s\S]*?</div>)",
-                re.IGNORECASE,
-            )
-            mm = pat.search(raw)
-            if mm:
-                pieces.append(f"<a class=\"sections\">{lab}</a>" + mm.group(1))
+
+        found_oop = False
+
+        def _append_label_and_table(label: str, html_block: str):
+            # Try to extract table id to avoid duplicates
+            nonlocal seen_table_ids
+            tid = None
+            try:
+                m_id = re.search(r'id\s*=\s*"(BenefitsTable\d+)"', html_block, re.IGNORECASE)
+                if m_id:
+                    tid = m_id.group(1)
+            except Exception:
+                tid = None
+            if tid and tid in seen_table_ids:
+                return
+            if tid:
+                seen_table_ids.add(tid)
+            pieces.append(f"<div class=\"benefit-section-label\">{label}</div>" + html_block)
+
+        # Accept headings/anchors/spans/divs containing label followed by a BenefitsTable div
+        def _find_and_append_by_labels(labels: List[str], mark_oop: bool = False):
+            nonlocal found_oop
+            for lab in labels:
+                pat = re.compile(
+                    rf"((<a[^>]*>\s*{lab}\s*</a>)|(<h[1-6][^>]*>\s*{lab}\s*</h[1-6]>)|(<span[^>]*>\s*{lab}\s*</span>)|(<div[^>]*>\s*{lab}\s*</div>))[\s\S]*?(<div[^>]*id=\"BenefitsTable\d+\"[\s\S]*?</div>)",
+                    re.IGNORECASE,
+                )
+                mm = pat.search(raw)
+                if mm:
+                    _append_label_and_table(lab, mm.group(6))
+                    if mark_oop:
+                        found_oop = True
+
+        _find_and_append_by_labels(core_labels, mark_oop=False)
+        _find_and_append_by_labels(oop_variants, mark_oop=True)
+
+        # Safe fallback: if we failed to detect any OOP block, include all benefit tables for AI to summarize
+        if not found_oop:
+            for mtab in re.finditer(r"(<div[^>]*id=\"BenefitsTable\d+\"[\s\S]*?</div>)", raw, re.IGNORECASE):
+                block = mtab.group(1)
+                m_id = re.search(r'id\s*=\s*"(BenefitsTable\d+)"', block, re.IGNORECASE)
+                tid = m_id.group(1) if m_id else None
+                if tid and tid in seen_table_ids:
+                    continue
+                if tid:
+                    seen_table_ids.add(tid)
+                pieces.append(block)
 
         content = "\n".join(pieces) if pieces else raw
         content = re.sub(r"\s+", " ", content).strip()
@@ -1272,6 +1329,17 @@ def main():
                     else:
                         OK_COUNT += 1
                     print("-> Sheet updated with comprehensive details and links.")
+
+                    # After finishing the row updates, save a PDF of the current report page for audit/debug
+                    try:
+                        patient_name_str = f"{patient_data['last_name']}_{patient_data['first_name']}"
+                        pdf_path = save_current_page_pdf(page, SCRIPT_DIR, patient_name_str)
+                        if pdf_path:
+                            print(f"-> Saved eligibility report PDF: {pdf_path}")
+                        else:
+                            print("-!- Failed to save eligibility report PDF for this row.")
+                    except Exception:
+                        print("-!- Exception occurred while saving eligibility report PDF.")
 
                 else:
                     if RUN_ONCE:

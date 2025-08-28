@@ -1,9 +1,7 @@
 ---
 applyTo: '**'
 ---
----
-applyTo: '**'
----
+
 # Copilot instructions for Eligibility-Bot
 
 Context for GitHub Copilot agents and human developers.
