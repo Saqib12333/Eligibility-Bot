@@ -1,13 +1,15 @@
 # Eligibility-Bot
 
-Automates real-time insurance eligibility checks in TriZetto, extracts structured benefit data with Gemini, and logs results to Google Sheets with screenshots uploaded to Google Drive.
+Automates real-time insurance eligibility checks in TriZetto, extracts structured benefit data with Gemini, and logs results to Google Sheets with PDFs uploaded to Google Drive.
 
 ## Features
 - Playwright browser automation (headless or UI)
 - AI-assisted form filling, payer selection, and report parsing (Gemini)
 - Hardened AI parsing: sanitized HTML input, strict JSON prompt, robust JSON extractor, and diagnostics on failure
 - Persistent login: Chromium profile directory + cookies fallback; OTP handled on-demand
-- Google Sheets updates and Drive uploads
+- Google Sheets updates and Drive uploads (PDFs)
+- PDF export via Chromium CDP and upload to Drive
+- Saves raw and sanitized HTML, and AI JSON/TXT artifacts per patient
 - Logging with rotating log file and end-of-run metrics (processed/ok/fail/retried)
 
 ## Prerequisites
@@ -35,27 +37,24 @@ Automates real-time insurance eligibility checks in TriZetto, extracts structure
 - One-shot mode: set `RUN_ONCE=true` to process the next pending row and exit.
 	- `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` (rotation with per-run start index)
 ## Configuration (env vars)
-- High token usage: confirm that `REPORT_HTML_MAX_CHARS` is reasonable and targeted sanitization is active. The bot keeps only eligibility essentials to reduce tokens while preserving Deductible/OOP sections.
-	- `SPREADSHEET_ID`, `SHEET_NAME`, `DRIVE_FOLDER_ID`, optional `PDF_DRIVE_FOLDER_ID`
-- TriZetto login
-- Q: Why do I sometimes see 429s on gemini-2.5-pro?
-	- A: Per-run key rotation helps distribute calls across keys between runs. The bot honors server-provided `retry_delay` and falls back to a lighter model if necessary.
+- Sheets/Drive: `SPREADSHEET_ID`, `SHEET_NAME`, `DRIVE_FOLDER_ID` (optional `PDF_DRIVE_FOLDER_ID`)
+- TriZetto: `TRIZETTO_USERNAME`, `TRIZETTO_PASSWORD`, `OTP_EMAIL_ADDRESS_TEXT`
+- AI: `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` (rotation between runs)
+- Behavior: `HEADLESS`, `RUN_ONCE`, `OPERATION_TIMEOUT_SECONDS`, `LOG_LEVEL`
+- Paths/cache: `CHROME_PROFILE_DIR`, `COOKIES_FILE`, `PAYER_CACHE_FILE`
+- HTML size cap: `REPORT_HTML_MAX_CHARS` to keep token usage reasonable while preserving Deductible/Out-of-Pocket sections
 
-## What’s new (v2.2.0)
-- Per-run API key rotation and attempt-level logging (model + key suffix, retry_delay observed)
-- Targeted report sanitization to keep eligibility essentials and reduce tokens
-- Payer-based form-fill plan cache (`FORM_FILL_CACHE_FILE`)
-- Per-row AI token usage printing
-	- `TRIZETTO_USERNAME`, `TRIZETTO_PASSWORD`, `OTP_EMAIL_ADDRESS_TEXT`
-	- Persistent profile dir: `CHROME_PROFILE_DIR` (default `./chrome-profile`)
-	- Cookies file: `COOKIES_FILE` (default `./Trizetto_cookies.pkl`)
-- AI (Gemini)
-	- `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` (rotation)
-- Behavior and reliability
-	- `HEADLESS` (true/false), `RUN_ONCE` (true/false)
-	- `OPERATION_TIMEOUT_SECONDS` (per-row timeout)
-	- `LOG_LEVEL` (INFO by default)
-	- `PAYER_CACHE_FILE` (default `./payer_cache.json`)
+Note: Per-run key rotation helps with 429s; the bot honors server-provided retry delays and may fall back to a lighter model when necessary.
+
+## What’s new (v2.3.0)
+- PDFs replace screenshots: export via Chromium CDP, upload to Drive, and write PDF link to the sheet
+- OOP-aware sanitizer: preserves Out-of-Pocket variants like "Out of Pocket (Stop Loss)", escapes labels in regex, and injects OOP context near the top if not structurally found
+- Artifacts per patient (First_Last):
+	- AI outputs: `logs/AI Response/First_Last.json` and `.txt` (on failure: `First_Last.fail.txt`)
+	- Sanitized HTML: `logs/Sanitized HTMLs/First_Last.html`
+	- Raw HTML: `logs/Raw HTMLs/First_Last.html`
+- Config: `REPORT_HTML_MAX_CHARS` to cap sanitized HTML length
+- Minor reliability: strict JSON prompting + robust JSON extractor; clearer diagnostics
 
 ## How it works
 1) Persistent session: launches Playwright with a persistent Chromium profile; falls back to cookies; otherwise performs login with manual OTP and saves cookies.
@@ -64,13 +63,14 @@ Automates real-time insurance eligibility checks in TriZetto, extracts structure
 4) Expands report UI, captures HTML, and asks AI for a single JSON object.
 	 - Input HTML is sanitized (scripts/styles/comments removed, whitespace collapsed, truncated to safe length).
 	 - Prompt enforces strict JSON only; a robust extractor parses the JSON object from the response.
-	 - On repeated failure, diagnostics are written to `logs/ai_report_fail_*.json` and `logs/report_html_*.html`.
-5) Takes an element screenshot (falls back to full page) and uploads to Google Drive; updates the sheet with status and summaries.
+	 - On repeated failure, diagnostics are written under `logs/AI Response/First_Last.fail.txt`; raw and sanitized HTMLs are saved under `logs/Raw HTMLs/` and `logs/Sanitized HTMLs/`.
+5) Exports a PDF of the report and uploads to Google Drive; updates the sheet with status and summaries.
 
 ## Logging, diagnostics, artifacts
 - Logs: `logs/eligibility-bot.log` (rotating file) and console output.
-- Diagnostics (on AI parse failure): `logs/ai_report_fail_*.json`, `logs/report_html_*.html`.
-- Screenshots: `Screenshots/` and uploaded to Drive.
+- AI outputs: `logs/AI Response/First_Last.json` and `.txt`; on failure: `logs/AI Response/First_Last.fail.txt`.
+- HTMLs: `logs/Sanitized HTMLs/First_Last.html` and `logs/Raw HTMLs/First_Last.html`.
+- PDFs: `logs/PDFs/Last_First.pdf` (also uploaded to Drive).
 - End-of-run summary: processed/ok/fail/retried counters in logs.
 
 ## Troubleshooting
@@ -127,15 +127,15 @@ Status: in progress; major items implemented
 
 ## Google Sheet format
 Inputs (A–F): DOS, First Name, Last Name, DOB, Payer Name, Member/Subscriber ID.
-Outputs (G–N): Status, Policy Begin, Policy End, Screenshot Link, Copay, Deductible, Coinsurance, Out of Pocket.
+Outputs (G–N): Status, Policy Begin, Policy End, PDF Link, Copay, Deductible, Coinsurance, Out of Pocket.
 
 ## FAQs
 - Q: I still get OTP prompts every run.
 	- A: Ensure `CHROME_PROFILE_DIR` points to a persistent folder and `COOKIES_FILE` exists/updates after manual OTP. Subsequent runs should use those.
 - Q: Why do I see “Failed to parse report”? 
-	- A: Check `logs/ai_report_fail_*.json` and `logs/report_html_*.html`. The model may have produced non-JSON or truncated output; sanitized inputs and extractor help, but diagnostics will show exact content.
-- Q: Where are screenshots stored?
-	- A: Locally under `Screenshots/` and uploaded to Google Drive folder set by `DRIVE_FOLDER_ID`.
+	- A: Check `logs/AI Response/First_Last.fail.txt` and compare `logs/Raw HTMLs/First_Last.html` vs `logs/Sanitized HTMLs/First_Last.html`. The model may have produced non-JSON or truncated output; sanitized inputs and the extractor help, and diagnostics will show exact content.
+- Q: Where are PDFs stored?
+	- A: Locally under `logs/PDFs/` (named `Last_First.pdf`) and uploaded to the Google Drive folder set by `DRIVE_FOLDER_ID`.
 
 ## Support
 Open an issue internally or provide failing diagnostics files to maintainers for prompt fixes.

@@ -1,5 +1,5 @@
 # bot.py
-# Version 5.4 - v2.2.0 with per-run API key rotation, targeted sanitization, and form-fill cache.
+# Version 5.4 - v2.3.0 with per-run API key rotation, targeted sanitization, and form-fill cache.
 
 import os
 import time
@@ -1477,7 +1477,7 @@ def get_oauth_credentials(scopes: list) -> Any:
 
 def main():
     """Main function to run the bot loop."""
-    print("--- Eligibility Bot (AI Full Suite v2.2.0) Starting Up ---")
+    print("--- Eligibility Bot (AI Full Suite v2.3.0) Starting Up ---")
 
     print("-> Authenticating with Google Services...")
     creds = get_oauth_credentials(SCOPES)

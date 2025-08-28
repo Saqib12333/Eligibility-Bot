@@ -2,7 +2,7 @@
 applyTo: '**'
 ---
 
-# Copilot instructions for Eligibility-Bot
+# Copilot instructions for Eligibility-Bot (v2.3.0)
 
 Context for GitHub Copilot agents and human developers.
 
@@ -21,7 +21,11 @@ Context for GitHub Copilot agents and human developers.
 - OAuth credentials file path from `CLIENT_SECRETS_FILE`.
 - Token path from `TOKEN_FILE`.
 - Session state from `STATE_FILE`.
-- Output artifacts go to `SCREENSHOT_DIR` and uploaded to Drive `DRIVE_FOLDER_ID`.
+- Local artifacts:
+	- AI outputs: `logs/AI Response/First_Last.(json|txt)`
+	- Sanitized HTML: `logs/Sanitized HTMLs/First_Last.html`
+	- Raw HTML: `logs/Raw HTMLs/First_Last.html`
+	- PDF: `logs/PDFs/Last_First.pdf` (uploaded to Drive folder `DRIVE_FOLDER_ID`)
 
 ## Editing guidelines for Copilot
 - When adding new config, wire it via `.env` and document it in `.env.example`.
@@ -29,7 +33,8 @@ Context for GitHub Copilot agents and human developers.
 - Avoid reflowing the entire file on small changes; keep diffs minimal.
 - Add type hints where obvious, but keep pragmatic for dynamic libs.
  - Keep AI outputs strictly JSON for report parsing; target-sanitize report HTML inputs (keep status h1, plan begin/end, and key benefit tables; remove noise) to reduce token pressure.
- - On parse failure, write diagnostics (raw AI text + sanitized HTML) under `logs/` with timestamps.
+ - Sanitizer: preserve Out-of-Pocket sections including variants like "Out of Pocket (Stop Loss)"; escape labels in regex; if not structurally found, inject nearby OOP context high in the output and finally include all BenefitsTable blocks as a safety net.
+ - On parse failure, write diagnostics to `logs/AI Response/First_Last.fail.txt`. Always keep the sanitized HTML under `logs/Sanitized HTMLs/` for comparison against raw.
 
 ## Testing tips
 - Set `HEADLESS=false` during debugging.
@@ -58,9 +63,9 @@ Context for GitHub Copilot agents and human developers.
 - Split into modules: `ai.py`, `sheets_drive.py`, `trizetto.py`, `main.py`.
 
 ### Phase C (Artifacts, Safety, UX)
-- Save raw report HTML and upload with screenshots.
-- Timestamp artifacts and include row indices.
-- Add print-to-PDF export upload.
+- Save raw report HTML locally (done).
+- Export PDF via Chromium CDP and upload (done). Replaced screenshots path with PDF.
+- Name AI artifacts and HTMLs by First_Last; PDFs currently Last_First.
 - Add a “Processing…” watchdog and graceful shutdown.
 
 ---
@@ -78,7 +83,7 @@ Minimal single-file implementation with clear responsibilities inside `bot.py`:
 	- `_extract_json_object()` to reliably parse a single JSON object from AI output.
 - Payer selection cache: JSON file at `PAYER_CACHE_FILE`.
 - Form-fill plan cache per payer: JSON file at `FORM_FILL_CACHE_FILE`.
-- Processing loop: fetch next row → select payer → AI fill plan → submit → expand/report → AI parse → screenshot/upload → update sheet.
+- Processing loop: fetch next row → select payer → AI fill plan → submit → expand/report → AI parse → PDF export/upload → update sheet.
 - Logging and metrics: rotating file in `logs/` + console; run summary at end.
 
 Project files you should know:
@@ -96,7 +101,7 @@ Project files you should know:
 4) Payer selection: Use cache or AI plan; robust waits/retries/scroll.
 5) Form fill: AI produces selectors/values; fill; submit; wait for response.
 6) Report parse: expand, sanitize HTML, prompt AI for strict JSON; parse with extractor.
-7) Artifacts: screenshot element (fallback full-page); upload to Drive; write results back.
+7) Artifacts: save Raw/Sanitized HTML + AI JSON/TXT locally; export PDF; upload to Drive; write results back.
 8) Loop or exit (RUN_ONCE).
 
 ## Environment variables (complete list)
@@ -105,6 +110,7 @@ Project files you should know:
 - AI: `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3` (per-run start rotation)
 - Behavior: `HEADLESS`, `RUN_ONCE`, `CHECK_INTERVAL_SECONDS`, `OPERATION_TIMEOUT_SECONDS`, `LOG_LEVEL`
 - Files/paths: `PAYER_CACHE_FILE`, `CHROME_PROFILE_DIR`, `COOKIES_FILE`
+	- Behavior: `REPORT_HTML_MAX_CHARS` to cap sanitized HTML size.
 
 ## Google Sheet schema
 Inputs (columns A–F):
@@ -119,7 +125,7 @@ Outputs (columns G–N):
 - G: Status (e.g., Active Coverage)
 - H: Policy Begin
 - I: Policy End
-- J: Screenshot Link (Drive)
+- J: PDF Link (Drive)
 - K: Copay (summary)
 - L: Deductible (summary)
 - M: Coinsurance (summary)
@@ -144,8 +150,13 @@ Strict output rules: double quotes, no trailing commas/comments; if missing, use
 
 ## Error handling and diagnostics
 - Form errors: `#EligibilityValidationErrors` checked after submit.
-- AI parse failures: retry once; on failure, write `logs/ai_report_fail_*.json` and `logs/report_html_*.html`.
-- Screenshots: element-level then full-page fallback; only upload if file exists.
+- AI parse failures: retry once; on failure, write `logs/AI Response/First_Last.fail.txt`; sanitized HTML is preserved for triage.
+- PDFs: created via `Page.printToPDF`, uploaded to Drive, link written to sheet.
+
+## Implementation notes (v2.3.0)
+- Function signature change: `get_all_report_data(html_content: str, patient_base_name: str)` to route per-patient artifacts.
+- Artifact naming: AI+HTMLs use First_Last; PDF remains Last_First for now.
+- Sanitizer updates: OOP label variants, regex label escaping, OOP-context insertion near top, fallback include-all BenefitsTable blocks.
 - Metrics: processed/ok/fail/retried counters logged at run end.
 
 ## Security and secrets (enforced)
