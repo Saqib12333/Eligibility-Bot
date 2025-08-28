@@ -20,7 +20,7 @@ import re
 import logging
 from logging.handlers import RotatingFileHandler
 from html import unescape
-from pdf import save_current_page_pdf
+# PDF helper will be defined inline below
 
 # --- API KEY ROTATION SETUP ---
 load_dotenv() # Load variables from .env file
@@ -101,6 +101,41 @@ if not logger.handlers:
     fh.setFormatter(fmt)
     logger.addHandler(ch)
     logger.addHandler(fh)
+
+    # --- PDF SAVE HELPER (inlined) ---
+    def save_current_page_pdf(page: Page, base_dir: str, patient_name: str, subdir: str = "logs/PDFs") -> Optional[str]:
+        """Save the current page as a PDF to base_dir/subdir/<patient_name>.pdf using Chromium CDP.
+
+        Returns absolute file path on success; None on failure.
+        """
+        try:
+            pdf_dir = os.path.join(base_dir, subdir)
+            os.makedirs(pdf_dir, exist_ok=True)
+            try:
+                page.emulate_media(media="print")
+            except Exception:
+                pass
+            client = page.context.new_cdp_session(page)
+            result = client.send('Page.printToPDF', {
+                'printBackground': True,
+                'preferCSSPageSize': True,
+                'scale': 0.95,
+                'landscape': False,
+                'transferMode': 'ReturnAsBase64'
+            })
+            data_b64 = result.get('data')
+            if not data_b64:
+                return None
+            def _sanitize(name: str) -> str:
+                return "".join(c for c in name if c.isalnum() or c in ("_", "-", "."))[:128]
+            safe = _sanitize(patient_name or f"report_{time.strftime('%Y%m%d-%H%M%S')}")
+            pdf_path = os.path.join(pdf_dir, f"{safe}.pdf")
+            import base64 as _b64
+            with open(pdf_path, 'wb') as f:
+                f.write(_b64.b64decode(data_b64))
+            return pdf_path
+        except Exception:
+            return None
 
 # Initialize API key cycle with per-run rotation and persist last start index under logs/
 def _init_api_key_cycle():
@@ -275,6 +310,9 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
             else:
                 pieces.append(bp)
 
+        # Track where intro (status + basic profile) ends so we can insert high-priority OOP context right after
+        intro_end_index = len(pieces)
+
         # 3) Benefits sections of interest (broadened matching, fewer structure assumptions)
         # Core labels
         core_labels = [
@@ -286,6 +324,8 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
         oop_variants = [
             "Out of Pocket",
             "Out-of-Pocket",
+            "Out of Pocket (Stop Loss)",
+            "Out-of-Pocket (Stop Loss)",
             "Maximum Out of Pocket",
             "Out-of-Pocket Maximum",
             "Out of Pocket Maximum",
@@ -301,6 +341,7 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
         ]
 
         found_oop = False
+        oop_context_blocks: List[str] = []
 
         def _append_label_and_table(label: str, html_block: str):
             # Try to extract table id to avoid duplicates
@@ -323,7 +364,7 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
             nonlocal found_oop
             for lab in labels:
                 pat = re.compile(
-                    rf"((<a[^>]*>\s*{lab}\s*</a>)|(<h[1-6][^>]*>\s*{lab}\s*</h[1-6]>)|(<span[^>]*>\s*{lab}\s*</span>)|(<div[^>]*>\s*{lab}\s*</div>))[\s\S]*?(<div[^>]*id=\"BenefitsTable\d+\"[\s\S]*?</div>)",
+                    rf"((<a[^>]*>\s*{re.escape(lab)}\s*</a>)|(<h[1-6][^>]*>\s*{re.escape(lab)}\s*</h[1-6]>)|(<span[^>]*>\s*{re.escape(lab)}\s*</span>)|(<div[^>]*>\s*{re.escape(lab)}\s*</div>))[\s\S]*?(<div[^>]*id=\"BenefitsTable\d+\"[\s\S]*?</div>)",
                     re.IGNORECASE,
                 )
                 mm = pat.search(raw)
@@ -334,6 +375,44 @@ def _sanitize_html_for_ai(html: str, max_chars: int = REPORT_HTML_MAX_CHARS) -> 
 
         _find_and_append_by_labels(core_labels, mark_oop=False)
         _find_and_append_by_labels(oop_variants, mark_oop=True)
+
+        # If OOP not found by structural labels, try direct keyword search and capture local context window(s)
+        if not found_oop:
+            # Combine variants with a few common phrases
+            oop_keywords = oop_variants + [
+                "Out of Pocket Responsibility",
+                "Out-of-Pocket Responsibility",
+                "Out of Pocket Amount",
+                "Maximum Out of Pocket",
+                "Max Out of Pocket",
+                "OOP",
+            ]
+            # Build regex that tolerates minor punctuation/spacing differences
+            alt = "|".join([re.escape(k) for k in oop_keywords])
+            pat = re.compile(alt, re.IGNORECASE)
+            max_blocks = 2  # avoid oversized output
+            for mi, mm in enumerate(pat.finditer(raw)):
+                if mi >= max_blocks:
+                    break
+                start = max(0, mm.start() - 2000)
+                end = min(len(raw), mm.end() + 4000)
+                snippet = raw[start:end]
+                # Try to expand to nearest surrounding <div>...</div> to avoid broken HTML chunks
+                try:
+                    # Find nearest preceding <div and subsequent </div>
+                    div_start = snippet.rfind("<div", 0, mm.start() - start)
+                    div_end_rel = snippet.find("</div>", mm.end() - start)
+                    if div_start != -1 and div_end_rel != -1:
+                        snippet = snippet[div_start:div_end_rel + len("</div>")]
+                except Exception:
+                    pass
+                oop_context_blocks.append(
+                    f"<div class=\"benefit-section-label\">Out-of-Pocket (Context)</div>" + snippet
+                )
+            if oop_context_blocks:
+                found_oop = True
+                # Insert OOP context blocks immediately after intro so they survive truncation
+                pieces[intro_end_index:intro_end_index] = oop_context_blocks
 
         # Safe fallback: if we failed to detect any OOP block, include all benefit tables for AI to summarize
         if not found_oop:
@@ -924,7 +1003,7 @@ def _try_fill_field(page: Page, label_candidates: list[str], value: str, timeout
             pass
     return False
 
-def get_all_report_data(html_content: str) -> dict:
+def get_all_report_data(html_content: str, patient_base_name: str) -> dict:
     """Uses Gemini to generate a single JSON object with all structured data from the report.
 
     Root-cause fixes:
@@ -935,10 +1014,11 @@ def get_all_report_data(html_content: str) -> dict:
     print("   - Asking AI to generate all report data (structured JSON with model fallback)...")
 
     sanitized_html = _sanitize_html_for_ai(html_content)
-    # Save the exact sanitized HTML we send to AI for inspection
+    # Save the exact sanitized HTML we send to AI for inspection, using firstname_lastname
     try:
-        ts_html = time.strftime("%Y%m%d-%H%M%S")
-        sanitized_path = os.path.join(logs_dir, f"report_html_sanitized_{ts_html}.html")
+        sanitized_dir = os.path.join(logs_dir, "Sanitized HTMLs")
+        os.makedirs(sanitized_dir, exist_ok=True)
+        sanitized_path = os.path.join(sanitized_dir, f"{patient_base_name}.html")
         with open(sanitized_path, "w", encoding="utf-8") as f:
             f.write(sanitized_html)
         print(f"   - Saved sanitized report HTML to: {sanitized_path}")
@@ -971,23 +1051,23 @@ def get_all_report_data(html_content: str) -> dict:
             "Do not include any text, explanations, or code fences before or after the JSON.\n\n"
             f"HTML Content:\n{sanitized_html}"
         )
-        models_struct = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-pro"]
+        models_struct = ["gemini-2.5-pro", "gemini-2.5-pro", "gemini-2.5-flash"]
         data_struct = _ai_json_with_schema(models_struct, SYSTEM_PROMPTS['report_generation'], user_prompt_struct, schema, attempts=3)
-        # Save success raw JSON for observability
-        ts_succ = time.strftime("%Y%m%d-%H%M%S")
+        # Save success raw JSON/TXT to AI Response with firstname_lastname
         try:
-            raw_ok_path = os.path.join(logs_dir, f"ai_report_raw_{ts_succ}.json")
+            ai_dir = os.path.join(logs_dir, "AI Response")
+            os.makedirs(ai_dir, exist_ok=True)
+            raw_ok_path = os.path.join(ai_dir, f"{patient_base_name}.json")
             with open(raw_ok_path, "w", encoding="utf-8") as f:
                 json.dump(data_struct, f, ensure_ascii=False, indent=2)
             print(f"   - Saved AI report JSON to: {raw_ok_path}")
-            # Also persist the exact text for debugging if ever needed
-            raw_txt_path = os.path.join(logs_dir, f"ai_report_struct_raw_{ts_succ}.txt")
+            raw_txt_path = os.path.join(ai_dir, f"{patient_base_name}.txt")
             try:
                 with open(raw_txt_path, "w", encoding="utf-8") as tf:
                     tf.write(json.dumps(data_struct, ensure_ascii=False, indent=2))
             except Exception:
                 pass
-        except Exception as _:
+        except Exception:
             pass
         print("   - AI successfully generated consolidated report data (structured output).")
         return data_struct
@@ -1011,14 +1091,15 @@ def get_all_report_data(html_content: str) -> dict:
         candidate = _extract_json_object(raw_text) or raw_text.replace("```json", "").replace("```", "").strip()
         try:
             data = json.loads(candidate)
-            # Save success raw JSON for observability
-            ts_succ = time.strftime("%Y%m%d-%H%M%S")
+            # Save success raw JSON/TXT to AI Response with firstname_lastname
             try:
-                raw_ok_path = os.path.join(logs_dir, f"ai_report_raw_{ts_succ}.json")
+                ai_dir = os.path.join(logs_dir, "AI Response")
+                os.makedirs(ai_dir, exist_ok=True)
+                raw_ok_path = os.path.join(ai_dir, f"{patient_base_name}.json")
                 with open(raw_ok_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 print(f"   - Saved AI report JSON to: {raw_ok_path}")
-                raw_txt_path = os.path.join(logs_dir, f"ai_report_text_raw_{ts_succ}.txt")
+                raw_txt_path = os.path.join(ai_dir, f"{patient_base_name}.txt")
                 with open(raw_txt_path, "w", encoding="utf-8") as tf:
                     tf.write(raw_text)
             except Exception:
@@ -1031,14 +1112,15 @@ def get_all_report_data(html_content: str) -> dict:
             raw_text = _prompt_with_retries()
             candidate = _extract_json_object(raw_text) or raw_text.replace("```json", "").replace("```", "").strip()
             data = json.loads(candidate)
-            # Save success raw JSON for observability (retry)
-            ts_succ = time.strftime("%Y%m%d-%H%M%S")
+            # Save success raw JSON/TXT to AI Response with firstname_lastname (retry)
             try:
-                raw_ok_path = os.path.join(logs_dir, f"ai_report_raw_{ts_succ}.json")
+                ai_dir = os.path.join(logs_dir, "AI Response")
+                os.makedirs(ai_dir, exist_ok=True)
+                raw_ok_path = os.path.join(ai_dir, f"{patient_base_name}.json")
                 with open(raw_ok_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 print(f"   - Saved AI report JSON to: {raw_ok_path}")
-                raw_txt_path = os.path.join(logs_dir, f"ai_report_text_raw_{ts_succ}.txt")
+                raw_txt_path = os.path.join(ai_dir, f"{patient_base_name}.txt")
                 with open(raw_txt_path, "w", encoding="utf-8") as tf:
                     tf.write(raw_text)
             except Exception:
@@ -1047,15 +1129,13 @@ def get_all_report_data(html_content: str) -> dict:
             return data
     except Exception as e:
         # Diagnostics: save raw output and sanitized HTML for investigation
-        ts = time.strftime("%Y%m%d-%H%M%S")
         try:
-            diag_json_path = os.path.join(logs_dir, f"ai_report_fail_{ts}.json")
-            with open(diag_json_path, "w", encoding="utf-8") as f:
+            ai_dir = os.path.join(logs_dir, "AI Response")
+            os.makedirs(ai_dir, exist_ok=True)
+            diag_txt_path = os.path.join(ai_dir, f"{patient_base_name}.fail.txt")
+            with open(diag_txt_path, "w", encoding="utf-8") as f:
                 f.write(locals().get('raw_text', ''))
-            diag_html_path = os.path.join(logs_dir, f"report_html_{ts}.html")
-            with open(diag_html_path, "w", encoding="utf-8") as f:
-                f.write(sanitized_html)
-            print(f"   -!- Diagnostics written to: {diag_json_path} and {diag_html_path}")
+            print(f"   -!- Diagnostics written to: {diag_txt_path}")
         except Exception as diag_err:
             print(f"   -!- Failed to write diagnostics: {diag_err}")
         print(f"   -!- AI failed to generate consolidated JSON after retry: {e}. Falling back to DOM parsing...")
@@ -1178,7 +1258,6 @@ def select_payer_with_ai(page: Page, payer_name: str, deadline_ts: Optional[floa
         
 def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
     """Handles all parsing, PDF generation, and uploads for a patient using a single AI call."""
-    screenshot_link = "N/A"
     pdf_link = "N/A"
     # Enforce per-row timeout
     deadline_ts = time.time() + OPERATION_TIMEOUT_SECONDS if OPERATION_TIMEOUT_SECONDS > 0 else None
@@ -1266,7 +1345,7 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
         page.wait_for_timeout(500)
         page.locator("#ExpandInfo > li > a").click()
         page.wait_for_timeout(1000)
-        # Ensure network is idle before proceeding to parse/screenshot
+        # Ensure network is idle before proceeding to parse and capture
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
@@ -1276,54 +1355,56 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
         report_container = page.locator("#eligibilityRequestResponse")
         report_html = report_container.inner_html()
         
+        # Build firstname_lastname base name for artifact naming and save raw HTML
+        patient_base_name = f"{patient_data['first_name']}_{patient_data['last_name']}"
+        patient_base_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", patient_base_name.strip())
+        try:
+            raw_dir = os.path.join(logs_dir, "Raw HTMLs")
+            os.makedirs(raw_dir, exist_ok=True)
+            raw_path = os.path.join(raw_dir, f"{patient_base_name}.html")
+            with open(raw_path, "w", encoding="utf-8") as f:
+                f.write(report_html)
+            print(f"   - Saved raw report HTML to: {raw_path}")
+        except Exception:
+            pass
+
         # --- NEW: SINGLE, CONSOLIDATED AI CALL ---
         _check_timeout(deadline_ts)
-        all_data = get_all_report_data(report_html)
+        all_data = get_all_report_data(report_html, patient_base_name)
         if "Error" in all_data:
             raise ValueError(all_data["Error"])
 
-        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
         patient_name_str = f"{patient_data['last_name']}_{patient_data['first_name']}"
-        
-
-
-
-        # --- Upload Screenshot (robust with fallback) ---
+        # --- Save and upload PDF instead of screenshot ---
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
         _check_timeout(deadline_ts)
-        screenshot_path = os.path.join(SCREENSHOT_DIR, f"screenshot_{patient_name_str}.png")
-        try:
-            # Ensure the element is in view, visible, then try an element-level screenshot first
-            report_container.scroll_into_view_if_needed()
-            report_container.wait_for(state="visible", timeout=10000)
-            page.wait_for_timeout(250)
-            report_container.screenshot(path=screenshot_path, timeout=90000)
-        except Exception as se:
-            print(f"   -!- Element screenshot failed ({se}). Falling back to full-page screenshot...")
-            try:
-                page.screenshot(path=screenshot_path, full_page=True, timeout=60000)
-            except Exception as se2:
-                print(f"   -!- Full-page screenshot also failed: {se2}")
-        # Attempt upload if a file was created
-        if os.path.exists(screenshot_path):
-            screenshot_link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, screenshot_path, 'image/png')
+        pdf_path = save_current_page_pdf(page, SCRIPT_DIR, patient_name_str)
+        if pdf_path and os.path.exists(pdf_path):
+            pdf_link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, pdf_path, 'application/pdf')
         else:
-            print("   -!- No screenshot file present to upload.")
+            print("   -!- PDF was not created; skipping upload.")
         # Prepare results for Google Sheet update
         summaries = all_data.get("summaries", {})
+        # Policy end fallback to end-of-year if missing
+        policy_begin = all_data.get("policy_begin", "Not Found")
+        policy_end = all_data.get("policy_end", "Not Found")
+        if isinstance(policy_end, str) and policy_end.strip().lower() == "not found":
+            # Extract year from begin date
+            year_match = re.search(r"(20\d{2})", str(policy_begin))
+            if year_match:
+                policy_end = f"12/31/{year_match.group(1)}"
         final_results = {
                 "status": all_data.get("status", "Not Found"),
-                "policy_begin": all_data.get("policy_begin", "Not Found"),
-                "policy_end": all_data.get("policy_end", "Not Found"),
+                "policy_begin": policy_begin,
+                "policy_end": policy_end,
                 "copay": summaries.get("copay", "Not Found"),
                 "deductible": summaries.get("deductible", "Not Found"),
                 "coinsurance": summaries.get("coinsurance", "Not Found"),
                 "out_of_pocket": summaries.get("out_of_pocket", "Not Found"),
-                "screenshot_link": screenshot_link,
-                # "pdf_link": pdf_link
+                "pdf_link": pdf_link
         }
         
         print(f"-> Check complete for {patient_data['first_name']}. Status: {final_results.get('status')}")
@@ -1338,15 +1419,7 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
 
     except Exception as e:
         print(f"   -!- An error occurred during patient processing: {e}")
-        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-        screenshot_path = os.path.join(SCREENSHOT_DIR, f"ERROR_{patient_data.get('last_name', 'Unknown')}_{patient_data.get('first_name', 'Patient')}.png")
-        if not page.is_closed():
-            try:
-                page.screenshot(path=screenshot_path, timeout=60000, full_page=True)
-            except Exception:
-                pass
-        
-        screenshot_link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, screenshot_path, 'image/png')
+        # On error we won't try to capture screenshot; PDF flow is best-effort only during success path
         # Print a compact per-row token usage summary even on error
         try:
             print(f"   - AI token usage (this row): prompt={USAGE_TOKENS.get('prompt',0)}, candidates={USAGE_TOKENS.get('candidates',0)}, total={USAGE_TOKENS.get('total',0)}")
@@ -1356,7 +1429,7 @@ def process_patient(page: Page, drive_service, patient_data: dict) -> dict:
         return {
             "status": f"Error: {type(e).__name__}", "policy_begin": f"{e}", "policy_end": "",
             "copay": "N/A", "deductible": "N/A", "coinsurance": "N/A", "out_of_pocket": "N/A",
-            "screenshot_link": screenshot_link
+            "pdf_link": "Upload Failed"
         }
 
 
@@ -1504,7 +1577,7 @@ def main():
                     sheet.update_cell(row_index_to_process, 7, results.get("status", "Error"))
                     sheet.update_cell(row_index_to_process, 8, results.get("policy_begin", ""))
                     sheet.update_cell(row_index_to_process, 9, results.get("policy_end", ""))
-                    sheet.update_cell(row_index_to_process, 10, results.get("screenshot_link", "Upload Failed"))
+                    sheet.update_cell(row_index_to_process, 10, results.get("pdf_link", "Upload Failed"))
                     # NEW: Additional benefit detail columns
                     sheet.update_cell(row_index_to_process, 11, results.get("copay", "Not Found"))
                     sheet.update_cell(row_index_to_process, 12, results.get("deductible", "Not Found"))
@@ -1517,12 +1590,17 @@ def main():
                         OK_COUNT += 1
                     print("-> Sheet updated with comprehensive details and links.")
 
-                    # After finishing the row updates, save a PDF of the current report page for audit/debug
+                    # After finishing the row updates, save a PDF of the current report page for audit/debug and update link if needed
                     try:
                         patient_name_str = f"{patient_data['last_name']}_{patient_data['first_name']}"
                         pdf_path = save_current_page_pdf(page, SCRIPT_DIR, patient_name_str)
                         if pdf_path:
                             print(f"-> Saved eligibility report PDF: {pdf_path}")
+                            link = upload_file_to_drive(drive_service, DRIVE_FOLDER_ID, pdf_path, 'application/pdf')
+                            try:
+                                sheet.update_cell(row_index_to_process, 10, link)
+                            except Exception:
+                                pass
                         else:
                             print("-!- Failed to save eligibility report PDF for this row.")
                     except Exception:
